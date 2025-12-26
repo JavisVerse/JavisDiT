@@ -1,6 +1,6 @@
 ## JavisBench: A Challenging Benchmark for for Joint Audio-Video Generation (JAVG) Evaluation
 
-As released in [HuggingFace](https://huggingface.co/datasets/JavisDiT/JavisBench),
+As released in [HuggingFace](https://huggingface.co/datasets/JavisVerse/JavisBench),
 JavisBench is a comprehensive and challenging benchmark for evaluating **text-to-audio-video generation** models.  
 It covers multiple aspects of generation quality, semantic alignment, and temporal synchrony, enabling thorough assessment in both controlled and real-world scenarios.
 
@@ -174,13 +174,13 @@ samples/JavisBench/sample_0001.wav
 ```
 
 From the root directory of the **JavisDiT** project,
-download the meta file and data of [JavisBench](https://huggingface.co/datasets/JavisDiT/JavisBench), and put them into `data/eval/`:
+download the meta file and data of [JavisBench](https://huggingface.co/datasets/JavisVerse/JavisBench), and put them into `data/eval/`:
 
 ```bash
 cd /path/to/JavisDiT
 mkdir -p data/eval
 
-huggingface-cli download --repo-type dataset JavisDiT/JavisBench --local-dir data/eval/JavisBench
+huggingface-cli download --repo-type dataset JavisVerse/JavisBench --local-dir data/eval/JavisBench
 ```
 
 Then, run evaluation:
