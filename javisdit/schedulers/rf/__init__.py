@@ -116,7 +116,6 @@ class RFLOW:
         prior_encoder=None,
         guidance_scale=None,
         progress=True,
-        return_attn_map=False
     ):
         modal_keys = list(latent_dict.keys())  # e.g., ['video', 'audio']
 
@@ -156,10 +155,8 @@ class RFLOW:
         if additional_args is not None:
             model_args.update(additional_args)
         model_args['num_timesteps'] = self.num_timesteps
-        model_args['return_attn_map'] = return_attn_map
 
         # prepare timesteps
-        ## num_timesteps means diffusion/training steps; num_sampling_steps means denoising/inference steps
         timesteps = [(1.0 - i / self.num_sampling_steps) * self.num_timesteps for i in range(self.num_sampling_steps)]
         if self.use_discrete_timesteps:
             timesteps = [int(round(t)) for t in timesteps]
@@ -173,8 +170,6 @@ class RFLOW:
                 noise_added[k] = torch.zeros_like(m, dtype=torch.bool)
                 noise_added[k] = noise_added[k] | (m == 1)
 
-        # pdb.set_trace()
-        attn_map_dict = {}
         progress_wrap = tqdm if progress else (lambda x: x)
         for i, t in enumerate(progress_wrap(timesteps)):
             z_in = {}
@@ -203,9 +198,6 @@ class RFLOW:
             t_in = torch.cat([t, t], 0)
 
             mm_pred = model(z_in, t_in, **model_args)
-            attn_maps = mm_pred.pop('attn_maps', None)
-            if i in np.linspace(0, len(timesteps)-1, 4, dtype=int):
-                attn_map_dict[f'step{i}'] = attn_maps
             
             for k, pred in mm_pred.items():
                 pred = pred.chunk(2, dim=1)[0]
@@ -228,9 +220,6 @@ class RFLOW:
                     z = torch.where(mask_t_upper, z, x0)
                 
                 latent_dict[k] = z
-
-        if return_attn_map:
-            latent_dict['attn_map'] = attn_map_dict
 
         return latent_dict
     

@@ -83,7 +83,6 @@ class CrossSTDiT3Block(nn.Module):
         t0=None,  # t with timestamp=0
         T=None,  # number of frames
         S=None,  # number of pixel patches
-        return_attn_map=False,
     ):
         dtype = x.dtype
         spatial_prior, temporal_prior = spatial_prior.to(dtype), temporal_prior.to(dtype)
@@ -112,9 +111,7 @@ class CrossSTDiT3Block(nn.Module):
         # prior: shape(B, S', C) -> shape(B*T, S', C) 
         spatial_prior = spatial_prior.unsqueeze(1).repeat(1, T, 1, 1).flatten(0,1)
         assert spatial_prior.shape[0] == x_m.shape[0] and spatial_prior.shape[-1] == x_m.shape[-1]
-        x_m = self.spatial_cross_attn(x_m, spatial_prior, mask, return_attn_map=return_attn_map)
-        if return_attn_map:
-            x_m, spatial_attn = x_m
+        x_m = self.spatial_cross_attn(x_m, spatial_prior, mask,)
         x_m = rearrange(x_m, "(B T) S C -> B (T S) C", T=T, S=S)
 
         # modulate (spatial attention)
@@ -137,9 +134,7 @@ class CrossSTDiT3Block(nn.Module):
         # prior: shape(B, T', C) -> shape(B*S, T', C) 
         temporal_prior = temporal_prior.unsqueeze(1).repeat(1, S, 1, 1).flatten(0,1)
         assert temporal_prior.shape[0] == x_m.shape[0] and temporal_prior.shape[-1] == x_m.shape[-1]
-        x_m = self.temporal_cross_attn(x_m, temporal_prior, mask, return_attn_map=return_attn_map)
-        if return_attn_map:
-            x_m, temporal_attn = x_m
+        x_m = self.temporal_cross_attn(x_m, temporal_prior, mask)
         x_m = rearrange(x_m, "(B S) T C -> B (T S) C", T=T, S=S)
 
         # modulate (temporal attention)
@@ -168,9 +163,6 @@ class CrossSTDiT3Block(nn.Module):
 
         # residual
         x = x + self.drop_path(x_m_s)
-
-        if return_attn_map:
-            x = (x, spatial_attn, temporal_attn)
 
         return x
 
@@ -617,12 +609,6 @@ class VASTDiT3(STDiT3):
         ax = rearrange(ax, "B T S C -> B (T S) C", T=R, S=M)
 
         # === blocks ===
-        return_attn_map = kwargs.get('return_attn_map', False)
-        def _parse_attn_map(attn_map: torch.Tensor):
-            attn_map = attn_map[:attn_map.shape[0]//2]  # CFG
-            attn_map = attn_map.softmax(dim=-2).mean(dim=(1,3))  # average #head and #prior
-            return attn_map.detach().cpu().to(torch.float16)
-        attn_maps = {}
         for i, (v_s_blk, v_t_blk, v_p_st_blk, a_s_blk, a_t_blk, a_p_st_blk, va_st_blk) in \
                 enumerate(zip(self.spatial_blocks, self.temporal_blocks, self.video_st_prior_blocks,
                               self.audio_spatial_blocks, self.audio_temporal_blocks, self.audio_st_prior_blocks,
@@ -635,18 +621,10 @@ class VASTDiT3(STDiT3):
             ax = auto_grad_checkpoint(a_t_blk, ax, ay, t_mlp, ay_lens, ax_mask, t0_mlp, R, M)
             # video-prior spatio-temporal cross-attention
             vx = auto_grad_checkpoint(v_p_st_blk, vx, spatial_prior, temporal_prior, \
-                                      t_st_mlp, None, x_mask, t0_st_mlp, T, S, return_attn_map=return_attn_map)
-            if return_attn_map:
-                vx, v_s_attn, v_t_attn = vx
-                attn_maps[f'block{i}_video_spatial'] = _parse_attn_map(v_s_attn)
-                attn_maps[f'block{i}_video_temporal'] = _parse_attn_map(v_t_attn)
+                                      t_st_mlp, None, x_mask, t0_st_mlp, T, S)
             # audio-prior spatio-temporal cross-attention
             ax = auto_grad_checkpoint(a_p_st_blk, ax, spatial_prior, temporal_prior, \
-                                      t_st_mlp, None, ax_mask, t0_st_mlp, R, M, return_attn_map=return_attn_map)
-            if return_attn_map:
-                ax, a_s_attn, a_t_attn = ax
-                attn_maps[f'block{i}_audio_spatial'] = _parse_attn_map(a_s_attn)
-                attn_maps[f'block{i}_audio_temporal'] = _parse_attn_map(a_t_attn)
+                                      t_st_mlp, None, ax_mask, t0_st_mlp, R, M)
             # video-audio spatio-temporal cross-attention  # TODO: mask
             vx, ax = auto_grad_checkpoint(va_st_blk, (vx, ax), (None, None))
             
@@ -669,8 +647,7 @@ class VASTDiT3(STDiT3):
         # cast to float32 for better accuracy
         vx, ax = vx.to(torch.float32), ax.to(torch.float32)
         ret = {'video': vx, 'audio': ax}
-        if return_attn_map:
-            ret['attn_maps'] = attn_maps
+
         return ret
 
     def unpatchify_audio(self, x, N_t, N_s, R_t, R_s):

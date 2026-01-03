@@ -579,7 +579,7 @@ class MultiHeadCrossAttention(nn.Module):
         self.proj = nn.Linear(d_model, d_model)
         self.proj_drop = nn.Dropout(proj_drop)
 
-    def forward(self, x, cond, mask=None, return_attn_map=False):
+    def forward(self, x, cond, mask=None):
         # query/value: img tokens; key: condition; mask: if padding tokens
         B, N, C = x.shape
 
@@ -590,20 +590,11 @@ class MultiHeadCrossAttention(nn.Module):
         attn_bias = None
         if mask is not None:
             attn_bias = xformers.ops.fmha.BlockDiagonalMask.from_seqlens([N] * B, mask)
-        if not return_attn_map:
-            x = xformers.ops.memory_efficient_attention(q, k, v, p=self.attn_drop.p, attn_bias=attn_bias)
-        else:
-            attn_bias = attn_bias.materialize() if attn_bias is not None else None
-            q = q.view(B, -1, self.num_heads, self.head_dim)
-            k = k.view(B, -1, self.num_heads, self.head_dim)
-            v = v.view(B, -1, self.num_heads, self.head_dim)
-            x, attn = self.vanilla_attention(q, k, v, attn_bias=attn_bias)
+        x = xformers.ops.memory_efficient_attention(q, k, v, p=self.attn_drop.p, attn_bias=attn_bias)
 
         x = x.view(B, -1, C)
         x = self.proj(x)
         x = self.proj_drop(x)
-        if return_attn_map:
-            x = (x, attn)
         return x
 
     def vanilla_attention(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, attn_bias: torch.Tensor):
