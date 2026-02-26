@@ -63,7 +63,8 @@ def update_ema(
         else:
             if param.data.dtype != torch.float32:
                 param_id = id(param)
-                master_param = optimizer._param_store.working_to_master_param[param_id]
+                # master_param = optimizer._param_store.working_to_master_param[param_id]
+                master_param = optimizer.working_to_master_param[param_id] # https://github.com/hpcaitech/Open-Sora/issues/642
                 param_data = master_param.data
             else:
                 param_data = param.data

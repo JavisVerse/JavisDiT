@@ -19,10 +19,11 @@ from tqdm import tqdm
 from tools.datasets.utils import extract_frames, is_video
 
 
-def merge_scores(gathered_list: list, meta: pd.DataFrame):
+def merge_scores(gathered_list: list, meta: pd.DataFrame, column='ocr'):
     # reorder
     indices_list = list(map(lambda x: x[0], gathered_list))
     scores_list = list(map(lambda x: x[1], gathered_list))
+
     flat_indices = []
     for x in zip(*indices_list):
         flat_indices.extend(x)
@@ -31,9 +32,14 @@ def merge_scores(gathered_list: list, meta: pd.DataFrame):
         flat_scores.extend(x)
     flat_indices = np.array(flat_indices)
     flat_scores = np.array(flat_scores)
+
     # filter duplicates
     unique_indices, unique_indices_idx = np.unique(flat_indices, return_index=True)
-    meta.loc[unique_indices, "ocr"] = flat_scores[unique_indices_idx]
+    meta.loc[unique_indices, column] = flat_scores[unique_indices_idx]
+
+    # drop indices in meta not in unique_indices
+    meta = meta.loc[unique_indices]
+    return meta
 
 
 class VideoTextDataset(torch.utils.data.Dataset):
@@ -145,6 +151,17 @@ def main():
         num_texts_i = [(x.pred_instances.scores > 0.3).sum().item() for x in pred]
         scores_list.extend(num_texts_i)
 
+    # save local results
+    meta_local = merge_scores([(indices_list, scores_list)], dataset.meta)
+    save_dir_local = os.path.join(os.path.dirname(out_path), "parts")
+    os.makedirs(save_dir_local, exist_ok=True)
+    out_path_local = os.path.join(
+        save_dir_local, os.path.basename(out_path).replace(".csv", f"_part_{dist.get_rank()}.csv")
+    )
+    meta_local.to_csv(out_path_local, index=False)
+
+    # wait for all ranks to finish data processing
+    dist.barrier()
     gathered_list = [None] * dist.get_world_size()
     dist.all_gather_object(gathered_list, (indices_list, scores_list))
 

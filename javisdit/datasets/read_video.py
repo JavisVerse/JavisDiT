@@ -4,14 +4,17 @@ import os
 import re
 import warnings
 from fractions import Fraction
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Literal, Any, Dict, List, Optional, Tuple, Union
 
 import av
 import cv2
+from decord import VideoReader, cpu
+
 import numpy as np
 import torch
-from torchvision import get_video_backend
+from torchvision import get_video_backend, transforms
 from torchvision.io.video import _check_av_available
+from torchvision.transforms import InterpolationMode
 
 from javisdit.datasets.utils import generate_temporal_window
 
@@ -212,12 +215,12 @@ def _read_from_stream(
     return result
 
 
-def read_video_cv2(video_path, num_frames=None, frame_interval=1):
+def read_video_cv2(video_path, num_frames=None, frame_interval=1, fix_start_frame=None):
     cap = cv2.VideoCapture(video_path)
 
     if not cap.isOpened():
         # print("Error: Unable to open video")
-        raise ValueError
+        raise ValueError(f"Error: Unable to open video {video_path}")
     else:
         fps = cap.get(cv2.CAP_PROP_FPS)
         vinfo = {
@@ -225,40 +228,44 @@ def read_video_cv2(video_path, num_frames=None, frame_interval=1):
         }
 
         if num_frames is not None:
-            # total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))  unsafe
-            cap.set(cv2.CAP_PROP_POS_AVI_RATIO, 1)
-            total_frames = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
-            cap.set(cv2.CAP_PROP_POS_AVI_RATIO, 0)
-            assert total_frames > 0, f'video {video_path} has no frames'
-            start_frame_ind, end_frame_ind = generate_temporal_window(total_frames, num_frames, frame_interval)
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))  # unsafe but faster
+            # cap.set(cv2.CAP_PROP_POS_AVI_RATIO, 1)
+            # total_frames = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
+            # cap.set(cv2.CAP_PROP_POS_AVI_RATIO, 0)
+            minimal_length = (num_frames-1) * frame_interval + 1
+            if fix_start_frame is None:
+                assert total_frames > minimal_length, f'Ensure video {video_path} has enough frames: {total_frames} < {minimal_length}'
+                start_frame_ind, end_frame_ind = generate_temporal_window(total_frames, num_frames, frame_interval)
+            else:
+                start_frame_ind = min(fix_start_frame, max(total_frames-minimal_length, 0))
+                end_frame_ind = min(start_frame_ind + minimal_length, total_frames)
             cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame_ind)
             vinfo.update({'total_frames': total_frames, 
                           'start_frame_ind': start_frame_ind, 'end_frame_ind': end_frame_ind})
 
         frames = []
         while True:
-            # Read a frame from the video
-            ret, frame = cap.read()
-            # ret, frame = True, np.zeros((1, 1, 3))  # dummy
+            sucess, frame = cap.read()
 
-            # If frame is not read correctly, break the loop
-            if not ret:
+            if not sucess:
                 break
 
             frames.append(frame[:, :, ::-1])  # BGR to RGB
 
-            if num_frames and len(frames) >= (num_frames-1) * frame_interval + 1:
-                frames = frames[::frame_interval]
-                assert len(frames) == num_frames, f'loaded {len(frames)}/{num_frames} frames from {video_path}'
+            if num_frames and len(frames) >= minimal_length:
                 break
 
-            # Exit if 'q' is pressed
-            if cv2.waitKey(25) & 0xFF == ord("q"):
-                break
-
-        # Release the video capture object and close all windows
         cap.release()
-        cv2.destroyAllWindows()
+
+        frames = frames[::frame_interval]
+        cur_frames = len(frames)
+        if fix_start_frame is None:
+            assert cur_frames == num_frames, f'loaded {cur_frames}/{num_frames} frames from {video_path}'
+        else:
+            if cur_frames < num_frames:
+                # padding the last frame
+                for _ in range(num_frames - cur_frames):
+                    frames.append(frames[-1])
 
         frames = np.stack(frames)
         frames = torch.from_numpy(frames)  # [T, H, W, C=3]
@@ -266,14 +273,96 @@ def read_video_cv2(video_path, num_frames=None, frame_interval=1):
         return frames, vinfo
 
 
+def read_video_decord(
+    video_file, output_format:Literal["TCHW", "THWC"]="TCHW",
+    max_length_sec_or_frame=None, start_sec_or_frame=0, end_sec_or_frame=None, 
+    frame_width=-1, frame_height=-1, fast_resize=True,
+    frames_sample_fps=None, frames_sample_num=None, frame_stride=2
+):
+    # TODO: support dynamic fps
+    if not fast_resize:
+        vr = VideoReader(video_file, ctx=cpu(0), num_threads=1)
+    else:
+        vr = VideoReader(video_file, ctx=cpu(0), num_threads=1, width=frame_width, height=frame_height)
+
+    raw_video_fps = vr.get_avg_fps()
+    total_frame_num = len(vr)
+    video_time = total_frame_num / raw_video_fps
+
+    for flag in [max_length_sec_or_frame, start_sec_or_frame, end_sec_or_frame]:
+        assert flag is None or type(flag) in [int, float], \
+            f'Unrecognizable data format for {flag=}, type={type(end_sec_or_frame)}'
+    # start sample frame
+    if isinstance(start_sec_or_frame, float):  # second
+        start_frame_idx = int(start_sec_or_frame * raw_video_fps)
+    elif isinstance(start_sec_or_frame, int):  # frame
+        assert start_sec_or_frame <= total_frame_num
+        start_frame_idx = start_sec_or_frame
+    # end sample frame
+    if max_length_sec_or_frame is not None and max_length_sec_or_frame > 0:
+        if isinstance(max_length_sec_or_frame, float):  # second
+            max_length_frame = int(round(max_length_sec_or_frame * raw_video_fps))
+        elif isinstance(max_length_sec_or_frame, int):  # frame
+            max_length_frame = max_length_sec_or_frame
+        total_frame_num = min(total_frame_num, start_frame_idx + max_length_frame)
+    if isinstance(end_sec_or_frame, float):  # second
+        total_frame_num = min(int(end_sec_or_frame * raw_video_fps), total_frame_num)
+    elif isinstance(end_sec_or_frame, int):  # frame
+        assert start_frame_idx <= end_sec_or_frame <= total_frame_num
+        total_frame_num = min(end_sec_or_frame, total_frame_num)
+    
+    assert frames_sample_fps is None or frames_sample_num is None, \
+        'Concurrently defining sampling frame number and fps is not supported'
+    if frames_sample_fps is not None:
+        avg_fps = round(raw_video_fps / frames_sample_fps)
+        frame_idx = [i for i in range(start_frame_idx, total_frame_num, avg_fps)]
+    elif frames_sample_num is not None:
+        if frame_stride > 0 and frames_sample_num % frame_stride != 0:
+            frames_sample_num = int(np.ceil(frames_sample_num / frame_stride)) * frame_stride
+        frame_idx = torch.linspace(start_frame_idx, total_frame_num - 1, frames_sample_num).round().long().tolist()
+    else:
+        frame_idx = torch.arange(start_frame_idx, total_frame_num).tolist()
+            
+    video = vr.get_batch(frame_idx).asnumpy()
+    frame_time = [i/raw_video_fps for i in frame_idx]
+    # frame_time = ",".join([f"{i:.2f}s" for i in frame_time])
+
+    num_frames_to_sample = num_frames = len(frame_idx)
+    # https://github.com/dmlc/decord/issues/208
+    vr.seek(0)
+
+    sample_fps = num_frames / (total_frame_num-start_frame_idx+1) * raw_video_fps
+
+    if output_format == "TCHW":
+        video = torch.tensor(video).permute(0, 3, 1, 2)  # Convert to TCHW format
+    if not fast_resize:
+        assert output_format == "TCHW"
+        video = transforms.functional.resize(
+            video,
+            [frame_height, frame_width],
+            interpolation=InterpolationMode.BICUBIC,
+            antialias=True,
+        ).float()
+
+    vinfo = {
+        'total_frames': num_frames_to_sample, 'video_fps': sample_fps,
+        # TODO: check the semantic meaning
+        # 'start_frame_ind': start_frame_idx, 'end_frame_ind': total_frame_num
+    }
+
+    return video, vinfo
+
+
 def read_video(video_path, backend="av", **kwargs):
     if kwargs.get('num_frames'):
-        assert backend == "cv2", "Only `cv2` mode support direct reading a clip"
+        assert backend == "cv2", "Currently only `cv2` mode support direct reading a clip"
     if backend == "cv2":
         vframes, vinfo = read_video_cv2(video_path, **kwargs)
     elif backend == "av":
         vframes, _, vinfo = read_video_av(filename=video_path, pts_unit="sec", 
                                           output_format="TCHW", **kwargs)
+    elif backend == "decord":
+        vframes, vinfo = read_video_decord(video_path, **kwargs)
     else:
         raise ValueError
 

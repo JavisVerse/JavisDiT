@@ -15,7 +15,9 @@ import av
 import numpy as np
 
 import torch
+import torch.nn.functional as F
 import torchvision.transforms as transforms
+import torchaudio
 
 from sklearn.metrics.pairwise import polynomial_kernel
 
@@ -24,6 +26,24 @@ AUD_EXTENSIONS = (".wav", ".mp3", ".flac", ".aac", ".m4a")
 
 
 ##########################################  common  #######################################
+
+def smart_pad(x: torch.Tensor, pad_len, dim=0, mode="constant", value=0, 
+              pos:Literal["right", "left", "both"]="right"):
+    if pad_len == 0:
+        return x
+    if dim < 0:
+        dim += x.ndim
+    assert dim < x.ndim, 'invalid padding dimension'
+    pad_dim = [0, 0] * (x.ndim - dim - 1)
+    if pos == "right":
+        pad_dim += [0, pad_len]
+    elif pos == "left":
+        pad_dim += [pad_len, 0]
+    else:
+        pad_dim += [pad_len, pad_len]
+    x = F.pad(x, pad_dim, mode=mode, value=value)
+    return x
+
 
 def read_video_cv2(video_path, num_frames, mode:Literal['raster', 'linspace']='linspace',
                    frame_transform=None):
@@ -97,6 +117,37 @@ def read_audio_librosa(audio_path, sr=16000, max_audio_len_s=None, padding=False
 
     return audio
 
+def read_audio_torchaudio(audio_path, sr=16000, max_audio_len_s=None, padding=False, 
+                          mono=True, keepdim=False, norm=True, resample=True, **kwargs):
+    waveform, sample_rate = torchaudio.load(audio_path)
+
+    if mono:
+        waveform = waveform.mean(dim=0, keepdim=keepdim)  # mono
+        if keepdim:
+            waveform = waveform.transpose(0, 1)
+
+    if norm:
+        waveform = waveform - waveform.mean()
+
+    audio = waveform
+    if resample and sample_rate != sr:
+        resampler = torchaudio.transforms.Resample(sample_rate, sr)
+        audio = resampler(waveform)
+
+    if max_audio_len_s:
+        assert mono
+        target_audio_len = int(sr * max_audio_len_s)
+        audio = audio[:target_audio_len]
+    
+        if padding and audio.shape[0] < target_audio_len:
+            audio = smart_pad(audio, target_audio_len-audio.shape[0], dim=0)
+
+    if keepdim:
+        audio = audio.transpose(0, 1)
+
+    return audio
+
+
 def read_audio_from_video_pyav(video_path, sr=16000):
     container = av.open(video_path)
     audio_stream = container.streams.audio[0]
@@ -130,9 +181,7 @@ def read_audio_from_video_pyav(video_path, sr=16000):
 
     container.close()
 
-    ainfo = {'audio_fps': float(sr)}
-
-    return audio_data[:, 0], ainfo
+    return audio_data[:, 0]
 
 
 VIDEO_READER_BACKENDS = {
@@ -149,7 +198,8 @@ def read_video(*args, **kwargs):
 
 AUDIO_READER_BACKENDS = {
     "librosa": read_audio_librosa,
-    'av': read_audio_from_video_pyav
+    "av": read_audio_from_video_pyav,
+    "torchaudio": read_audio_torchaudio,
 }
 FORCE_AUDIO_READER = os.getenv("FORCE_AUDIO_READER", None)
 
@@ -315,6 +365,15 @@ class Extract_CAVP_Features(torch.nn.Module):
     
     
     def init_first_from_ckpt(self, path):
+        if not osp.exists(path):
+            print(f"Downloading CAVP weights to {path} ...")
+            os.makedirs(osp.dirname(path), exist_ok=True)
+            torch.hub.download_url_to_file(
+                "https://huggingface.co/SimianLuo/Diff-Foley/resolve/main/diff_foley_ckpt/cavp_epoch66.ckpt",
+                path,
+                progress=True,
+            )
+
         model = torch.load(path, map_location="cpu", weights_only=False)
         if "state_dict" in list(model.keys()):
             model = model["state_dict"]
@@ -384,3 +443,21 @@ class Extract_CAVP_Features(torch.nn.Module):
 
 
 ########################################  CAVPScore  ######################################
+
+
+# from synchformer
+def pad_or_truncate(audio: torch.Tensor,
+                    max_spec_t: int,
+                    pad_mode: str = 'constant',
+                    pad_value: float = 0.0):
+    difference = max_spec_t - audio.shape[-1]  # safe for batched input
+    # pad or truncate, depending on difference
+    if difference > 0:
+        # pad the last dim (time) -> (..., n_mels, 0+time+difference)  # safe for batched input
+        pad_dims = (0, difference)
+        audio = torch.nn.functional.pad(audio, pad_dims, pad_mode, pad_value)
+    elif difference < 0:
+        print(f'Warning: Truncating spec ({audio.shape}) to max_spec_t ({max_spec_t}).')
+        audio = audio[..., :max_spec_t]  # safe for batched input
+    return audio
+

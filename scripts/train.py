@@ -19,6 +19,7 @@ from colossalai.booster import Booster
 from colossalai.cluster import DistCoordinator
 from colossalai.nn.optimizer import HybridAdam
 from colossalai.utils import get_current_device, set_seed
+from peft import LoraConfig
 from tqdm import tqdm
 
 from javisdit.acceleration.checkpoint import set_grad_checkpoint
@@ -26,7 +27,7 @@ from javisdit.acceleration.parallel_states import get_data_parallel_group
 from javisdit.datasets.datasets import VariableVideoTextDataset
 from javisdit.datasets.dataloader import prepare_dataloader
 from javisdit.registry import DATASETS, MODELS, SCHEDULERS, build_module
-from javisdit.utils.ckpt_utils import load, model_gathering, model_sharding, record_model_param_shape, save
+from javisdit.utils.ckpt_utils import load, load_checkpoint, model_gathering, model_sharding, record_model_param_shape, save
 from javisdit.utils.config_utils import define_experiment_workspace, parse_configs, save_training_config
 from javisdit.utils.lr_scheduler import LinearWarmupLR
 from javisdit.utils.misc import (
@@ -149,12 +150,12 @@ def main():
     else:
         text_encoder_output_dim = cfg.get("text_encoder_output_dim", 4096)
         text_encoder_model_max_length = cfg.get("text_encoder_model_max_length", 300)
-    
+
     # == build prior-encoder ==
     prior_encoder = build_module(cfg.get('prior_encoder', None), MODELS)
     if prior_encoder is not None:
-        prior_encoder = prior_encoder.to(device, dtype).eval()    
-    
+        prior_encoder = prior_encoder.to(device, dtype).eval()
+
     # == build video vae ==
     vae = build_module(cfg.get("vae", None), MODELS)
     if vae is not None:
@@ -192,6 +193,39 @@ def main():
         .train()
     )
 
+    # == setup lora ==
+    lora_enabled = cfg.get("lora_enabled", False)
+    if lora_enabled:
+        # Ugly: enable lora will make all of original parameters freezed, free them again
+        trainable_list = []
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                trainable_list.append(f'base_model.model.{name}')
+
+        lora_pretrained_dir = cfg.get("lora_pretrained_dir", None)
+        if lora_pretrained_dir is None:
+            lora_config = LoraConfig(
+                r=cfg.get('lora_r', 16),
+                lora_alpha=cfg.get('lora_alpha', 16),
+                target_modules=cfg.get('lora_target_modules', []),
+                lora_dropout=cfg.get('lora_dropout', 0),
+            )
+        else:
+            logger.info(f"Loading lora config and weights from {lora_pretrained_dir}")
+            lora_config = None
+        model = booster.enable_lora(model, pretrained_dir=lora_pretrained_dir, lora_config=lora_config)
+
+        lora_pretrained_path = cfg.get("lora_pretrained_path", None)
+        if lora_pretrained_path is not None:
+            lora_state_dict = torch.load(lora_pretrained_path, map_location='cpu')
+            lora_state_dict = {k.replace('.weight', '.default.weight'): v for k, v in lora_state_dict.items()}
+            missing_keys, unexpected_keys = model.load_state_dict(lora_state_dict, strict=False)
+            logger.info(f"{len(lora_state_dict)-len(unexpected_keys)}/{len(lora_state_dict)} keys loaded from {lora_pretrained_path}.")
+        
+        for name, param in model.named_parameters():
+            if name in trainable_list:
+                param.requires_grad_(True)
+
     model_numel, model_numel_trainable = get_model_numel(model)
     logger.info(
         "Trainable model params: %s, Total model params: %s",
@@ -205,6 +239,16 @@ def main():
     ema_shape_dict = record_model_param_shape(ema)
     ema.eval()
     update_ema(ema, model, decay=0, sharded=False)
+
+    # == DPO training ==
+    dpo_enabled = cfg.get("dpo_enabled", False)
+    if dpo_enabled:
+        dpo_beta = cfg.get("dpo_beta", 500) 
+        ref_model = deepcopy(model)
+        ref_model.requires_grad_(False)
+        ref_model.eval()
+    else:
+        dpo_beta, ref_model = None, None
 
     # == setup loss function, build scheduler ==
     scheduler = build_module(cfg.scheduler, SCHEDULERS)
@@ -253,7 +297,7 @@ def main():
     # == global variables ==
     cfg_epochs = cfg.get("epochs", 1000)
     start_epoch = start_step = log_step = acc_step = 0
-    running_loss = 0.0
+    running_loss_dict = {'loss': 0.0}
     logger.info("Training for %s epochs with %s steps per epoch", cfg_epochs, num_steps_per_epoch)
 
     # == resume ==
@@ -274,6 +318,14 @@ def main():
 
     model_sharding(ema)
 
+    # == prepare negprompt text embedding ==
+    if cfg.get('neg_prompt', None) is not None:
+        y_null_model_args = text_encoder.encode([cfg.neg_prompt]) # "y" and "mask"
+        y_null_model_args['y_null'] = y_null_model_args.pop('y', None) # avoid confiliction with "y"
+        y_null_model_args['mask_null'] = y_null_model_args.pop('mask', None)
+        # Auto-broadcast, including DPO mode
+        logger.info(f'Using neg_prompt for classifier-free gudiance training: {cfg.neg_prompt} ')
+    
     # =======================================================
     # 5. training loop
     # =======================================================
@@ -300,12 +352,18 @@ def main():
             disable=not coordinator.is_master(),
             initial=start_step,
             total=num_steps_per_epoch,
+            ncols=50
         ) as pbar:
             for step, batch in pbar:
                 timer_list = []
                 with timers["move_data"] as move_data_t:
-                    x = batch.pop("video").to(device, dtype)  # [B, C, T, H, W]
-                    ax = batch.pop("audio").to(device, dtype) # [B, 1, T, M]
+                    x = batch.pop("video").to(device, dtype)  # [B, C, Tv, H, W]
+                    ax = batch.pop("audio").to(device, dtype) # [B, 1, Ta, M]
+                    if dpo_enabled:
+                        x_rej = batch.pop("video_reject").to(device, dtype)  # [B, C, Tv, H, W]
+                        ax_rej = batch.pop("audio_reject").to(device, dtype) # [B, 1, Ta, M]
+                        x = torch.cat((x, x_rej), dim=0)      # [B*2, C, Tv, H, W]
+                        ax = torch.cat((ax, ax_rej), dim=0)   # [B*2, 1, Ta, M]
                     batch_num_frames = batch['num_frames']
                     batch_fps = batch['fps']
                     batch_duration = batch_num_frames / batch_fps
@@ -336,8 +394,12 @@ def main():
                             model_args["mask"] = mask
                         else:
                             model_args = text_encoder.encode(y)
+                        if dpo_enabled:
+                            model_args["mask"] = torch.cat([model_args["mask"], model_args["mask"]], dim=0)
+                            model_args["y"] = torch.cat([model_args["y"], model_args["y"]], dim=0)
                         # Prepare spatio-temporal prior
                         if prior_encoder is not None:
+                            assert not dpo_enabled, "NotImplemented"
                             model_args.update(prior_encoder.encode(raw_text))
                 if record_time:
                     timer_list.append(encode_t)
@@ -347,7 +409,10 @@ def main():
                     mask, ax_mask = None, None
                     if cfg.get("mask_ratios", None) is not None:
                         mask, ax_mask = mask_generator.get_masks(x, ax)  # shape(B, T)
-                        model_args["x_mask"] = mask  
+                        if dpo_enabled:
+                            mask = torch.cat([mask, mask], dim=0)
+                            ax_mask = torch.cat([ax_mask, ax_mask], dim=0)
+                        model_args["x_mask"] = mask
                         model_args["ax_mask"] = ax_mask
                 if record_time:
                     timer_list.append(mask_t)
@@ -356,12 +421,21 @@ def main():
                 for k, v in batch.items():
                     if isinstance(v, torch.Tensor):
                         model_args[k] = v.to(device, dtype)
+                
+                # == prepare neg prompt text embeddings args ==
+                if cfg.get('neg_prompt', None) is not None:
+                    model_args.update(y_null_model_args)
+
+                # == prepare training mode args ==
+                model_args.update({
+                    'audio_only': audio_only, 
+                    'dpo_enabled': dpo_enabled, 'dpo_beta': dpo_beta, 'ref_model': ref_model
+                })
 
                 # == diffusion loss computation ==
                 with timers["diffusion"] as loss_t:
                     # loss_dict = scheduler.training_losses(model, x, model_args, mask=mask)
                     x = {'video': x, 'audio': ax}
-                    model_args.update({'audio_only': audio_only})
                     mask = {'video': mask, 'audio': ax_mask}
                     loss_dict = scheduler.multimodal_training_losses(model, x, model_args, mask=mask)
                 if record_time:
@@ -389,7 +463,12 @@ def main():
                 # == update log info ==
                 with timers["reduce_loss"] as reduce_loss_t:
                     all_reduce_mean(loss)
-                    running_loss += loss.item()
+                    running_loss_dict['loss'] += loss.item()
+                    for k, v in loss_dict.items():
+                        if k != "loss":
+                            if k not in running_loss_dict:
+                                running_loss_dict[k] = 0.0
+                            running_loss_dict[k] += all_reduce_mean(v).item()
                     global_step = epoch * num_steps_per_epoch + step
                     log_step += 1
                     acc_step += 1
@@ -398,12 +477,16 @@ def main():
 
                 # == logging ==
                 if coordinator.is_master() and (global_step + 1) % cfg.get("log_every", 1) == 0:
-                    avg_loss = running_loss / log_step
+                    avg_loss = {}
+                    for k, v in running_loss_dict.items():
+                        avg_loss[k] = v / log_step
                     # progress bar
-                    pbar.set_postfix({"loss": avg_loss, "step": step, "global_step": global_step})
-                    logger.info({"loss": avg_loss, "step": step, "global_step": global_step})
+                    print_loss = {k: f"{v:.4f}" for k, v in avg_loss.items()}
+                    pbar.set_postfix({**print_loss, "step": step, "global_step": global_step})
+                    logger.info({**print_loss, "step": step, "global_step": global_step})
                     # tensorboard
-                    tb_writer.add_scalar("loss", loss.item(), global_step)
+                    for k, v in avg_loss.items():
+                        tb_writer.add_scalar(k, v, global_step)
                     # wandb
                     if cfg.get("wandb", False):
                         wandb_dict = {
@@ -411,7 +494,7 @@ def main():
                             "acc_step": acc_step,
                             "epoch": epoch,
                             "loss": loss.item(),
-                            "avg_loss": avg_loss,
+                            **{f"avg_loss_{k}": v for k, v in avg_loss.items()},
                             "lr": optimizer.param_groups[0]["lr"],
                         }
                         if record_time:
@@ -428,13 +511,14 @@ def main():
                             )
                         wandb.log(wandb_dict, step=global_step)
 
-                    running_loss = 0.0
+                    running_loss_dict = {"loss": 0.0}
                     log_step = 0
 
                 # == checkpoint saving ==
                 ckpt_every = cfg.get("ckpt_every", 0)
                 if ckpt_every > 0 and (global_step + 1) % ckpt_every == 0:
                     model_gathering(ema, ema_shape_dict)
+                    dist.barrier()
                     save_dir = save(
                         booster,
                         exp_dir,
@@ -447,8 +531,9 @@ def main():
                         step=step + 1,
                         global_step=global_step + 1,
                         batch_size=cfg.get("batch_size", None),
+                        lora_enabled=lora_enabled,
+                        lora_dir=cfg.get("lora_dir", "lora")
                     )
-                    dist.barrier()
                     if dist.get_rank() == 0:
                         model_sharding(ema)
 
@@ -477,12 +562,13 @@ def main():
         sampler.reset()
         start_step = 0
         torch.cuda.empty_cache()
-    
+
     model_gathering(ema, ema_shape_dict)
     save_dir = save(
         booster, exp_dir,
         model=model, ema=ema, optimizer=optimizer, lr_scheduler=lr_scheduler, sampler=sampler,
         epoch=epoch, step=step + 1, global_step=global_step + 1, batch_size=cfg.get("batch_size", None),
+        lora_enabled=lora_enabled, lora_dir=cfg.get("lora_dir", "lora")
     )
     logger.info(
         "Saved final checkpoint at epoch %s, step %s, global_step %s to %s",

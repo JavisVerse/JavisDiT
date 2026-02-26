@@ -23,6 +23,7 @@ def parse_args(training=False):
         type=str,
         help="path to model ckpt; will overwrite cfg.model.from_pretrained if specified",
     )
+    parser.add_argument("--lora-dir", default="lora", type=str, help="path to LoRA weights")
     parser.add_argument("--batch-size", default=None, type=int, help="batch size")
     parser.add_argument("--outputs", default=None, type=str, help="the dir to save model weights")
     parser.add_argument("--flash-attn", default=None, type=str2bool, help="enable flash attention")
@@ -41,7 +42,7 @@ def parse_args(training=False):
         parser.add_argument("--start-index", default=None, type=int, help="start index for sample name")
         parser.add_argument("--end-index", default=None, type=int, help="end index for sample name")
         parser.add_argument("--num-sample", default=None, type=int, help="number of samples to generate for one prompt")
-        parser.add_argument("--prompt-as-path", action="store_true", help="use prompt as path to save samples")
+        parser.add_argument("--prompt-as-path", default=None, type=str2bool, help="use prompt as path to save samples")
         parser.add_argument("--verbose", default=None, type=int, help="verbose level")
 
         # prompt
@@ -74,6 +75,10 @@ def parse_args(training=False):
         parser.add_argument("--aes", default=None, type=float, help="aesthetic score")
         parser.add_argument("--flow", default=None, type=float, help="flow score")
         parser.add_argument("--camera-motion", default=None, type=str, help="camera motion")
+        parser.add_argument("--fix-noise-seed", default=False, type=str2bool, help="seed per generation for reproducibility")
+
+        # distributed
+        parser.add_argument("--enable-sequence-parallelism", default=None, type=str2bool, help="enable sp for distributed inference")
     # ======================================================
     # Training
     # ======================================================
@@ -83,9 +88,9 @@ def parse_args(training=False):
         parser.add_argument("--load", default=None, type=str, help="path to continue training")
         parser.add_argument("--load-data", default=None, type=str, help="path to load pre-processed data")
         parser.add_argument("--save-data", default=None, type=str, help="path to save pre-processed data")
-        parser.add_argument("--start-from-scratch", action="store_true", help="start training from scratch")
+        parser.add_argument("--start-from-scratch", default=None, type=str2bool, help="start training from scratch")
         parser.add_argument("--warmup-steps", default=None, type=int, help="warmup steps")
-        parser.add_argument("--record-time", default=False, action="store_true", help="record time of each part")
+        parser.add_argument("--record-time", default=False, type=str2bool, help="record time of each part")
 
         # multi-node training for mpirun
         parser.add_argument("--host", default=None, type=str, help="host node name or ip for multi-node training")

@@ -65,7 +65,7 @@ def load_i3d_pretrained(device=torch.device('cpu')):
     #     filepath = download(_I3D_PRETRAINED_ID, 'i3d_pretrained_400.pt')
     # dist.barrier()
     url = "https://huggingface.co/spaces/LanguageBind/Open-Sora-Plan-v1.0.0/resolve/810fa8c4bdb3a4c8eec9bd57375c29bde6fb46de/opensora/eval/fvd/videogpt/i3d_pretrained_400.pt"
-    output_path = "./weights/i3d_pretrained_400.pt"
+    output_path = "./checkpoints/i3d_pretrained_400.pt"
     if not os.path.exists(output_path):
         filepath = download(url, output_path)
     is_strict=True

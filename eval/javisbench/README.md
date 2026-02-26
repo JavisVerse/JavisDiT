@@ -1,6 +1,6 @@
 ## JavisBench: A Challenging Benchmark for for Joint Audio-Video Generation (JAVG) Evaluation
 
-As released in [HuggingFace](https://huggingface.co/datasets/JavisVerse/JavisBench),
+As released in [HuggingFace](https://huggingface.co/datasets/JavisDiT/JavisBench),
 JavisBench is a comprehensive and challenging benchmark for evaluating **text-to-audio-video generation** models.  
 It covers multiple aspects of generation quality, semantic alignment, and temporal synchrony, enabling thorough assessment in both controlled and real-world scenarios.
 
@@ -49,13 +49,86 @@ To support faster evaluation, we also provide a smaller-scale **JavisBench-mini*
 :warning: **NOTE**: YouTube raw audio-video data is not released due to copyright restrictions. Instead, we provide pre-extracted audio-video features for FVD/KVD/FAD evaluation (will be introduced below). For other metrics, raw audio-video data is not required — only input textual captions and generated audio-video pairs from your model are needed.
 
 
-### 2. Evaluation Metrics
 
-We evaluate JAVG models from **4** complementary perspectives: (1) Audio/Video Quality, (2) Text to Audio/Video Consistency, (3) Audio-Video Consistency, and (4) Audio-Video Synchrony.
+### 2. Installation
+
+Install necessary packages:
+
+```bash
+cd /path/to/JavisDiT
+
+pip install -r requirements/requirements-eval.txt
+```
+
+All necessary pre-trained models will be automatically downloaded to `./checkpoints`.
+
+### 3. Evaluation
+
+Assume your generated results are saved under:
+
+```bash
+samples/JavisBench/sample_0000.mp4  # or JavisBench-mini
+samples/JavisBench/sample_0000.wav
+samples/JavisBench/sample_0001.mp4
+samples/JavisBench/sample_0001.wav
+...
+```
+
+From the root directory of the **JavisDiT** project,
+download the meta file and data of [JavisBench](https://huggingface.co/datasets/JavisDiT/JavisBench), and put them into `data/eval/`:
+
+```bash
+cd /path/to/JavisDiT
+mkdir -p data/eval
+
+huggingface-cli download --repo-type dataset JavisDiT/JavisBench --local-dir data/eval/JavisBench
+```
+
+Then, run evaluation:
+
+```bash
+# If you use conda, set the LD_LIBRARY_PATH environment variable to find ffmpeg for torchaudio
+export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/path/to/conda/envs/javisdit/lib
+
+MAX_FRAMES=16
+IMAGE_SIZE=224
+MAX_AUDIO_LEN_S=4.0
+
+# Params to calculate JavisScore
+WINDOW_SIZE_S=2.0
+WINDOW_OVERLAP_S=1.5
+
+METRICS="all" 
+RESULTS_DIR="./evaluation_results"
+
+DATASET="JavisBench"  # or JavisBench-mini
+INPUT_FILE="data/eval/JavisBench/${DATASET}.csv"
+FVD_AVCACHE_PATH="data/eval/JavisBench/cache/fvd_fad/${DATASET}-vanilla-max4s.pt"
+INFER_DATA_DIR="samples/${DATASET}"
+
+export CUDA_VISIBLE_DEVICES="0"
+torchrun --nproc_per_node=1 -m eval.javisbench.main \
+  --input_file "${INPUT_FILE}" \
+  --infer_data_dir "${INFER_DATA_DIR}" \
+  --output_file "${RESULTS_DIR}/${DATASET}.json" \
+  --max_frames ${MAX_FRAMES} \
+  --image_size ${IMAGE_SIZE} \
+  --max_audio_len_s ${MAX_AUDIO_LEN_S} \
+  --window_size_s ${WINDOW_SIZE_S} \
+  --window_overlap_s ${WINDOW_OVERLAP_S} \
+  --fvd_avcache_path ${FVD_AVCACHE_PATH} \
+  --metrics ${METRICS}
+```
+
+The results will be displayed in terminal and saved in `./evaluation_results`.
 
 
-<details> 
-<summary> Clik to expand: (1) Audio/Video Quality </summary>
+### 4. Details of Evaluation Metrics
+
+We evaluate JAVG models from **4** complementary perspectives:
+
+
+#### 4.1 Audio / Video Quality
 
 Measures on the perceptual quality of the generated audio and video.
 
@@ -74,12 +147,8 @@ Measures on the perceptual quality of the generated audio and video.
   Same concept as FVD, but computed on **audio** features extracted by a pretrained audio model (e.g., [AudioClip](https://arxiv.org/pdf/2106.13043)).
   Measures distribution distance between generated and real audio; **lower is better**.
 
-</details> 
 
-
-<details> 
-<summary> Clik to expand: (2) Text to Audio/Video Consistency </summary>
-
+#### 4.2 Semantic Consistency Against Conditional Texts
 
 Evaluates how well the generated audio and video semantically match the input text description.
 
@@ -97,10 +166,8 @@ Evaluates how well the generated audio and video semantically match the input te
 * **[CLAP](https://github.com/LAION-AI/CLAP) Similarity** (Text–Audio)
   Uses CLAP to compute semantic similarity between text and audio.
 
-</details> 
 
-<details> 
-<summary> Clik to expand: (3) Audio-Video Consistency </summary>
+#### 4.3 Audio–Video Semantic Consistency
 
 Measures the semantic alignment between generated audio and generated video.
 
@@ -118,13 +185,10 @@ Measures the semantic alignment between generated audio and generated video.
 
   A higher AVHScore indicates stronger audio–video semantic consistency.
 
-</details> 
 
+#### 4.4 Audio–Video Spatio-Temporal Synchrony
 
-<details> 
-<summary> Clik to expand: (4) Audio-Video Synchrony </summary>
-
-- **JavisScore**:
+- **[JavisScore](https://arxiv.org/abs/2503.23377)**:
   A new metric we propose to measure temporal synchrony between audio and video. The core idea is using a sliding window along the temporal axis to split the audio-video pair into short segments. For each segment, compute cross-modal similarity (e.g., with [ImageBind]((https://github.com/facebookresearch/ImageBind) )) and take the mean score:
 
   $\mathrm{JavisScore} = \frac{1}{N} \sum_{i=1}^{N} \sigma(a_i, v_i) , \quad \sigma(v_i,a_i) = \frac{1}{k} \sum_{j=1}^{k} \mathop{\text{top-}k}\limits_{\min} \{ \cos\left(E_v(v_{i,j}), E_a(a_{i})\right) \}$
@@ -150,73 +214,14 @@ Measures the semantic alignment between generated audio and generated video.
   * $\mathbb{1}_{\cdot}$ is the indicator function—1 if a match exists within the window, otherwise 0.
   * Higher scores indicate better alignment in both directions.
 
-</details> 
+- **[DeSync](https://github.com/v-iashin/Synchformer)**:
+  This metric trains a transformer-based classifier to predict one of 21 temporal offset classes (ranging from –2s to +2s) between the input audio and video pair. The predicted class is converted into an estimated shift $\Delta$, and the final DeSync score is the mean absolute offset:
 
+  $$
+  \mathrm{DeSync} = \tfrac{1}{N}\sum_{i=1}^N |\Delta_i|
+  $$
 
-### 3. Evaluation
-
-Install the evaluation dependencies:
-
-```bash
-cd /path/to/JavisDiT
-
-pip install -r requirements/requirements-eval.txt
-```
-
-Assume your generated results are saved under:
-
-```bash
-samples/JavisBench/sample_0000.mp4  # or JavisBench-mini
-samples/JavisBench/sample_0000.wav
-samples/JavisBench/sample_0001.mp4
-samples/JavisBench/sample_0001.wav
-...
-```
-
-From the root directory of the **JavisDiT** project,
-download the meta file and data of [JavisBench](https://huggingface.co/datasets/JavisVerse/JavisBench), and put them into `data/eval/`:
-
-```bash
-cd /path/to/JavisDiT
-mkdir -p data/eval
-
-huggingface-cli download --repo-type dataset JavisVerse/JavisBench --local-dir data/eval/JavisBench
-```
-
-Then, run evaluation:
-
-```bash
-MAX_FRAMES=16
-IMAGE_SIZE=224
-MAX_AUDIO_LEN_S=4.0
-
-# Params to calculate JavisScore
-WINDOW_SIZE_S=2.0
-WINDOW_OVERLAP_S=1.5
-
-METRICS="all" 
-RESULTS_DIR="./evaluation_results"
-
-DATASET="JavisBench"  # or JavisBench-mini
-INPUT_FILE="data/eval/JavisBench/${DATASET}.csv"
-FVD_AVCACHE_PATH="data/eval/JavisBench/cache/fvd_fad/${DATASET}-vanilla-max4s.pt"
-INFER_DATA_DIR="samples/${DATASET}"
-
-python -m eval.javisbench.main \
-  --input_file "${INPUT_FILE}" \
-  --infer_data_dir "${INFER_DATA_DIR}" \
-  --output_file "${RESULTS_DIR}/${DATASET}.json" \
-  --max_frames ${MAX_FRAMES} \
-  --image_size ${IMAGE_SIZE} \
-  --max_audio_len_s ${MAX_AUDIO_LEN_S} \
-  --window_size_s ${WINDOW_SIZE_S} \
-  --window_overlap_s ${WINDOW_OVERLAP_S} \
-  --fvd_avcache_path ${FVD_AVCACHE_PATH} \
-  --metrics ${METRICS}
-```
-
-The results will be displayed in terminal and saved in `./evaluation_results`.
-
+  Smaller values indicate better synchrony, with 0 meaning perfect alignment.
 
 ## Citation
 

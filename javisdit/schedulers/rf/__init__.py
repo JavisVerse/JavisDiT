@@ -1,7 +1,6 @@
 import torch
 from tqdm import tqdm
 import numpy as np
-import pdb
 
 from javisdit.registry import SCHEDULERS
 
@@ -44,6 +43,7 @@ class RFLOW:
         mask=None,
         guidance_scale=None,
         progress=True,
+        neg_prompts=None,
     ):
         # if no specific guidance scale is provided, use the default scale when initializing the scheduler
         if guidance_scale is None:
@@ -54,8 +54,13 @@ class RFLOW:
         ## y: shape(bs,1,300,4096), last hidden state
         model_args = text_encoder.encode(prompts)
         ## y_null: randn(bs,1,300,4096), seems repeated; null prompt for classifier-free guidance
-        y_null = text_encoder.null(n)
-        model_args["y"] = torch.cat([model_args["y"], y_null], 0)
+        if neg_prompts is None:
+            y_null = text_encoder.null(n)
+            model_args["y"] = torch.cat([model_args["y"], y_null], 0)
+        else:
+            y_null_model_args = text_encoder.encode(neg_prompts)
+            model_args["y"] = torch.cat([model_args["y"], y_null_model_args["y"]], 0)
+            model_args["mask"] = torch.cat([model_args["mask"], y_null_model_args["mask"]], 0)
         if additional_args is not None:
             model_args.update(additional_args)
 
@@ -90,7 +95,9 @@ class RFLOW:
             # classifier-free guidance
             z_in = torch.cat([z, z], 0)
             t = torch.cat([t, t], 0)
-            pred = model(z_in, t, **model_args).chunk(2, dim=1)[0]
+            pred = model(z_in, t, **model_args)
+            if pred.shape[1] == z.shape[1] * 2:
+                pred = pred.chunk(2, dim=1)[0]
             pred_cond, pred_uncond = pred.chunk(2, dim=0)
             v_pred = pred_uncond + guidance_scale * (pred_cond - pred_uncond)
 
@@ -116,6 +123,8 @@ class RFLOW:
         prior_encoder=None,
         guidance_scale=None,
         progress=True,
+        neg_prompts=None,
+        return_attn_map=False,
     ):
         modal_keys = list(latent_dict.keys())  # e.g., ['video', 'audio']
 
@@ -128,12 +137,19 @@ class RFLOW:
         ## y: shape(bs,1,300,4096), last hidden state;
         if isinstance(prompts, dict):
             model_args = prompts
-            prompts = prompts.pop("prior_emb")  # compatible for prior_encoder.encode(prompts)
+            prompts = prompts.pop("prior_emb", None)  # compatible for prior_encoder.encode(prompts)
         else:
             model_args = text_encoder.encode(prompts)
         ## y_null: randn(bs,1,300,4096), seems repeated; null prompt for classifier-free guidance
-        y_null = text_encoder.null(n)
-        model_args["y"] = torch.cat([model_args["y"], y_null], 0)
+        if neg_prompts is None:
+            y_null = text_encoder.null(n)
+            model_args["y"] = torch.cat([model_args["y"], y_null], 0)
+        else:
+            y_null_model_args = text_encoder.encode(neg_prompts)
+            model_args["y"] = torch.cat([model_args["y"], y_null_model_args["y"]], 0)
+            model_args["mask"] = torch.cat([model_args["mask"], y_null_model_args["mask"]], 0)
+        if additional_args is not None:
+            model_args.update(additional_args)
         # spatio-temporal prior encoding
         if prior_encoder is not None:
             prior_dict = prior_encoder.encode(prompts)
@@ -155,8 +171,10 @@ class RFLOW:
         if additional_args is not None:
             model_args.update(additional_args)
         model_args['num_timesteps'] = self.num_timesteps
+        model_args['return_attn_map'] = return_attn_map
 
         # prepare timesteps
+        ## num_timesteps means diffusion/training steps; num_sampling_steps means denoising/inference steps
         timesteps = [(1.0 - i / self.num_sampling_steps) * self.num_timesteps for i in range(self.num_sampling_steps)]
         if self.use_discrete_timesteps:
             timesteps = [int(round(t)) for t in timesteps]
@@ -170,6 +188,8 @@ class RFLOW:
                 noise_added[k] = torch.zeros_like(m, dtype=torch.bool)
                 noise_added[k] = noise_added[k] | (m == 1)
 
+        # pdb.set_trace()
+        attn_map_dict = {}
         progress_wrap = tqdm if progress else (lambda x: x)
         for i, t in enumerate(progress_wrap(timesteps)):
             z_in = {}
@@ -198,17 +218,27 @@ class RFLOW:
             t_in = torch.cat([t, t], 0)
 
             mm_pred = model(z_in, t_in, **model_args)
+            attn_maps = mm_pred.pop('attn_maps', None)
+            if i in np.linspace(0, len(timesteps)-1, 4, dtype=int):
+                attn_map_dict[f'step{i}'] = attn_maps
             
             for k, pred in mm_pred.items():
-                pred = pred.chunk(2, dim=1)[0]
+                # TODO: redundant?
+                if pred is None: # single modality inference
+                    continue
+
+                z = latent_dict[k]
+
+                if pred.shape[1] == z.shape[1] * 2:
+                    pred = pred.chunk(2, dim=1)[0]
                 pred_cond, pred_uncond = pred.chunk(2, dim=0)
                 v_pred = pred_uncond + guidance_scale * (pred_cond - pred_uncond)
 
                 # update z
-                z = latent_dict[k]
                 x0 = z.clone()
                 dt = timesteps[i] - timesteps[i + 1] if i < len(timesteps) - 1 else timesteps[i]
                 dt = dt / self.num_timesteps
+                # import pdb; pdb.set_trace()
                 z = z + v_pred * dt.view(-1, *([1] * (len(z.shape) - 1)))
 
                 if mask is not None:
@@ -220,6 +250,9 @@ class RFLOW:
                     z = torch.where(mask_t_upper, z, x0)
                 
                 latent_dict[k] = z
+
+        if return_attn_map:
+            latent_dict['attn_map'] = attn_map_dict
 
         return latent_dict
     

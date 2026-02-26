@@ -111,15 +111,18 @@ class T5Embedder:
         self.model_max_length = model_max_length
 
     def get_text_embeddings(self, texts):
-        text_tokens_and_mask = self.tokenizer(
-            texts,
-            max_length=self.model_max_length,
-            padding="max_length",
-            truncation=True,
-            return_attention_mask=True,
-            add_special_tokens=True,
-            return_tensors="pt",
-        )
+        if isinstance(texts, dict):
+            text_tokens_and_mask = {k: texts[k] for k in ['input_ids', 'attention_mask']}
+        else:
+            text_tokens_and_mask = self.tokenizer(
+                texts,
+                max_length=self.model_max_length,
+                padding="max_length",
+                truncation=True,
+                return_attention_mask=True,
+                add_special_tokens=True,
+                return_tensors="pt",
+            )
 
         input_ids = text_tokens_and_mask["input_ids"].to(self.device)
         attention_mask = text_tokens_and_mask["attention_mask"].to(self.device)
@@ -142,6 +145,7 @@ class T5Encoder:
         cache_dir=None,
         shardformer=False,
         local_files_only=False,
+        **kwargs,
     ):
         assert from_pretrained is not None, "Please specify the path to the T5 model"
 
@@ -155,6 +159,7 @@ class T5Encoder:
         )
         self.t5.model.to(dtype=dtype)
         self.y_embedder = None
+        self.pretrained_ckpt_path = from_pretrained
 
         self.model_max_length = model_max_length
         self.output_dim = self.t5.model.config.d_model
@@ -162,6 +167,11 @@ class T5Encoder:
 
         if shardformer:
             self.shardformer_t5()
+
+    def load_pretrained_ckpt(self):
+        self.t5.model.load_state_dict(
+            T5EncoderModel.from_pretrained(self.pretrained_ckpt_path).state_dict()
+        )
 
     def shardformer_t5(self):
         from colossalai.shardformer import ShardConfig, ShardFormer
@@ -332,4 +342,4 @@ def text_preprocessing(text, use_text_preprocessing: bool = True):
         text = clean_caption(text)
         return text
     else:
-        return text.lower().strip()
+        return text #.lower().strip()

@@ -121,7 +121,7 @@ def get_image_info(path, backend="pillow"):
         raise ValueError
 
 
-def get_video_info(path, backend="cv2"):
+def get_video_info(path, backend="cv2", method="set"):
     if backend == "torchvision":
         try:
             vframes, infos = read_video(path)
@@ -139,7 +139,7 @@ def get_video_info(path, backend="cv2"):
         try:
             cap = cv2.VideoCapture(path)
             num_frames, height, width, fps = (
-                get_video_length(cap, method="header"),
+                get_video_length(cap, method=method),
                 int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)),
                 int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
                 float(round(cap.get(cv2.CAP_PROP_FPS))),
@@ -503,7 +503,7 @@ def read_data(input_paths):
 
 
 def unify_fps(input_path, dst_fps, overwrite=True):
-    src_fps = get_video_info(input_path)[-2]
+    src_fps = get_video_info(input_path, method='header')[-2]
     if src_fps != dst_fps:
         ext = os.path.splitext(input_path)[1].lower()
         output_path = input_path.replace(ext, f'_fps{dst_fps}' + ext)
@@ -642,9 +642,10 @@ def set_dummy_video(input_path):
     num_frames = int(duration * fps)
     height, width, aspect_ratio, resolution = 720, 1280, 0.5625, 921600
     text = 'placeholder'
+    speech = -1
     return path, _id, relpath, num_frames, \
-           height, width, aspect_ratio, fps, resolution,\
-           text
+            height, width, aspect_ratio, fps, resolution,\
+            speech, text
 
 
 def video_crop_resize(input_path, target_wh):
@@ -696,6 +697,33 @@ def video_crop_resize(input_path, target_wh):
     subprocess.run(["mv", temp_path, input_path], check=True)
 
     return dst_w, dst_h, dst_as, dst_res
+
+
+def fix_video(input_path):
+    cap = cv2.VideoCapture(input_path)
+    if not cap.isOpened():
+        print(f'Cannot open {input_path}')
+        return 0, 0
+    if get_video_length(cap, 'header') != get_video_length(cap, 'set'):
+        ext = os.path.splitext(input_path)[-1]
+        cache_path = input_path.replace(ext, f'_fix{ext}')
+        ffmpeg_command = [
+            "ffmpeg",
+            "-i", input_path,
+            "-c:v", "libx264",
+            "-c:a", "aac",
+            "-crf", "18" ,
+            "-preset", "veryfast",
+            "-y", cache_path
+        ]
+        result = subprocess.run(ffmpeg_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        os.rename(cache_path, input_path)
+        print('fixed:', input_path)
+    cap.release()
+
+    num_frames, _, _, _, fps, _ = get_video_info(input_path, method='header')
+    
+    return num_frames, fps
 
 
 # ======================================================
@@ -796,15 +824,17 @@ def main(args):
         data = data[data["audio_fps"] == args.audio_sr]
     if args.dummy_video:
         info = apply(data["audio_path"], set_dummy_video)
-        path, _id, relpath, num_frames, height, width, aspect_ratio, fps, resolution, \
-            text = zip(*info)
-        data = pd.DataFrame({
-            'path': path, 'id': _id, 'relpath': relpath, 'num_frames': num_frames,
-            'height': height, 'width': width, 'aspect_ratio': aspect_ratio,
-            'fps': fps, 'resolution': resolution, 
-            'audio_path': data['audio_path'], 'audio_fps': data['audio_fps'],
-            'text': text, 'audio_text': data.get('audio_text', [''] * len(data)),
-        })
+        path, _id, relpath, num_frames, height, width, aspect_ratio, \
+            fps, resolution, speech, text = zip(*info)
+        data = {'path': path, 'id': _id, 'relpath': relpath, 'num_frames': num_frames,
+                'height': height, 'width': width, 'aspect_ratio': aspect_ratio,
+                'fps': fps, 'resolution': resolution, 
+                'audio_path': data['audio_path'], 'audio_fps': data['audio_fps'],
+                'speech': speech, 'text': text, 'audio_text': data['audio_text']}
+        data = pd.DataFrame(data)
+    if args.fix_video:
+        info = apply(data["path"], fix_video)
+        data["num_frames"], data['fps'] = zip(*info)
 
     # filtering
     if args.remove_url:
@@ -912,6 +942,9 @@ def main(args):
         data = data[data["path"].str.lower().str.endswith(IMG_EXTENSIONS)]
     if args.vid_only:
         data = data[~data["path"].str.lower().str.endswith(IMG_EXTENSIONS)]
+    if args.nospeech:
+        assert "speech" in data.columns
+        data = data[data["speech"] == 0]
 
     # process data
     if args.shuffle:
@@ -976,6 +1009,7 @@ def parse_args():
     parser.add_argument("--audio-sr", type=int, default=None, help="pre-defined audio sample rate")
     parser.add_argument("--dummy-video", action="store_true", help="set dummy videos for given audios")
     parser.add_argument("--overwrite", action="store_true", help="overwrite data file")
+    parser.add_argument("--fix-video", action="store_true", help="fix video reading problem")
 
     # path processing
     parser.add_argument("--relpath", type=str, default=None, help="modify the path to relative path by root given")
@@ -1027,6 +1061,7 @@ def parse_args():
     parser.add_argument("--img-only", action="store_true", help="only keep the image data")
     parser.add_argument("--vid-only", action="store_true", help="only keep the video data")
     parser.add_argument("--ocrmax", type=int, default=None, help="filter the dataset by maximum orc score")
+    parser.add_argument("--nospeech", action="store_true", help="filter the dataset by speech detection results")
 
     # data processing
     parser.add_argument("--shuffle", default=False, action="store_true", help="shuffle the dataset")
@@ -1078,6 +1113,8 @@ def get_output_path(args, input_name):
         name += f"_sr{args.audio_sr}"
     if args.dummy_video:
         name += f"_dummy_videos"
+    if args.fix_video:
+        name += f"_videofix"
 
     # path processing
     if args.relpath is not None:
@@ -1142,6 +1179,8 @@ def get_output_path(args, input_name):
         name += "_img"
     if args.vid_only:
         name += "_vid"
+    if args.nospeech:
+        name += "_nospeech"
 
     # processing
     if args.shuffle:

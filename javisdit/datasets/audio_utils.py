@@ -82,7 +82,7 @@ class AudioLDM2MelTransform(object):
         # get mel_spec
         log_mel_spec, stft, energy = self.get_mel_from_wav(waveform)
         log_mel_spec = torch.from_numpy(log_mel_spec.T)
-        log_mel_spec = self.pad_spec(log_mel_spec, duration)
+        log_mel_spec = self.pad_spec(log_mel_spec, duration, scale_factor=self.scale_factor)
 
         # reshape(1, t, 64)
         log_mel_spec = log_mel_spec[None, :, :]
@@ -97,6 +97,7 @@ class AudioLDM2MelTransform(object):
         self.sampling_rate = self.config["preprocessing"]["audio"]["sampling_rate"]
         self.hopsize = self.config["preprocessing"]["stft"]["hop_length"]
         self.duration = self.config["preprocessing"]["audio"]["duration"]
+        self.scale_factor = self.config["preprocessing"]["audio"].get("scale_factor", 32)
         self.target_length = int(self.duration * self.sampling_rate / self.hopsize)
 
         self.mixup = self.config["augmentation"]["mixup"]

@@ -106,7 +106,7 @@ class Bucket:
                     prob_t = prob[1]  # accept prob 1
                     if rng.random() > prob_t:
                         continue
-                if T > t_id * frame_interval and t_id != 1:
+                if T >= t_id * frame_interval and t_id != 1:
                     # ok when total frames more than pre-defined frame_num
                     t_fail = False
                     break

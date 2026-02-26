@@ -56,9 +56,12 @@ class STIBPriorExtractor(STPriorExtractor):
 
         return ib_dim, encoder
     
-    def encode_text(self, text: List[str]):
+    def encode_text(self, text: Union[List[str], Dict[str, torch.Tensor]]):
         device = self.spatial_query_emb.device
-        ib_text = imagebind_data.load_and_transform_text(text, device)
+        if isinstance(text, dict):
+            ib_text = text['ib_text'].to(device=device)
+        else:
+            ib_text = imagebind_data.load_and_transform_text(text, device)
         inputs = {ModalityType.TEXT: ib_text}
         with torch.no_grad():
             ib_embeddings = self.text_encoder(inputs, return_hidden_states=True)
@@ -66,6 +69,11 @@ class STIBPriorExtractor(STPriorExtractor):
         ib_text_hidden = ib_embeddings[ModalityType.TEXT+ModalityType.HIDDEN_SUFFIX] 
 
         return ib_text_hidden  # shape(bs, 77, 1024)
+
+    # Compatible with JavisGPT
+    def load_pretrained_ckpt(self):
+        self.load_imagebind(self.config.imagebind_ckpt_path)
+        load_checkpoint(self, self.from_pretrained_path, strict=True)
 
 
 @MODELS.register_module("STIBPrior")
@@ -77,4 +85,5 @@ def BaseSTPrior(from_pretrained=None, **kwargs):
         model = STIBPriorExtractor(config)
         if from_pretrained is not None:
             load_checkpoint(model, from_pretrained, strict=True)
+    setattr(model, 'from_pretrained_path', 'from_pretrained')
     return model

@@ -22,7 +22,8 @@ IMAGE_TRANSFORM = tv.transforms.Compose([
 ])
 torch.set_grad_enabled(False)
 #ROOT_PATHES=[os.path.join(os.path.dirname(os.path.abspath(__file__)), '../../copy/assets'), "/mnt/external/code/guided-diffusion/models/"]
-ROOT=os.path.expanduser("./weights/")
+ROOT=os.path.expanduser("./checkpoints/")
+
 def download(fname):
     destination = os.path.join(ROOT, fname)
     if os.path.exists(destination):

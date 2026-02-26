@@ -6,3 +6,4 @@ from .text_encoder import *
 from .prior_encoder import *
 from .vae import *
 from .vae_audio import *
+from .wan import *

@@ -285,12 +285,17 @@ def save(
     step: int = None,
     global_step: int = None,
     batch_size: int = None,
+    lora_enabled: bool = False,
+    lora_dir: str = "lora",
 ):
     save_dir = os.path.join(save_dir, f"epoch{epoch:03d}-global_step{global_step}")
     os.makedirs(os.path.join(save_dir, "model"), exist_ok=True)
 
     if model is not None:
         booster.save_model(model, os.path.join(save_dir, "model"), shard=True)
+        if lora_enabled:
+            os.makedirs(os.path.join(save_dir, lora_dir), exist_ok=True)
+            booster.save_lora_as_pretrained(model, os.path.join(save_dir, lora_dir))
     if optimizer is not None:
         booster.save_optimizer(optimizer, os.path.join(save_dir, "optimizer"), shard=True, size_per_shard=4096)
     if lr_scheduler is not None:

@@ -9,8 +9,6 @@ import random
 import math
 from typing import List, Dict, Optional
 
-import librosa
-from moviepy.editor import VideoFileClip
 from PIL import Image
 import cv2
 
@@ -19,15 +17,20 @@ import clip
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from einops import rearrange
 from transformers import AutoProcessor, ClapModel
+import torchaudio
 
 from .fvd.fvd import get_fvd_logits, frechet_distance
 from .fvd.download import load_i3d_pretrained
 from .AudioCLIP.get_embedding import load_audioclip_pretrained, get_audioclip_embeddings_scores
-from .utils import polynomial_mmd, Extract_CAVP_Features
+from .utils import polynomial_mmd, Extract_CAVP_Features, pad_or_truncate, smart_pad
+from .synchformer.synchformer import Synchformer, make_class_grid
+from .VideoAlign.inference import VideoVLMRewardInference
+from audiobox_aesthetics.infer import initialize_predictor as initialize_audio_aes_predictor
 
 sys.path.append(os.path.join(os.path.dirname(__file__), "ImageBind"))
-from .ImageBind.imagebind import data
+from .ImageBind.imagebind import data as imagebind_data
 from .ImageBind.imagebind.models import imagebind_model
 from .ImageBind.imagebind.models.imagebind_model import ModalityType
 
@@ -36,12 +39,29 @@ from .dataset import (
     create_dataloader_for_fvd_vanilla, create_dataloader_for_fvd_mmdiff
 )
 
+def calc_fvd_kvd_fad_direct(embed_dict, indices=None):
+    fake_video_embed = embed_dict['fake']['video'].clone()
+    real_video_embed = embed_dict['real']['video'].clone()
+    fake_audio_embed = embed_dict['fake']['audio'].clone()
+    real_audio_embed = embed_dict['real']['audio'].clone()
+
+    if indices is not None:
+        fake_video_embed = fake_video_embed[indices]
+        real_video_embed = real_video_embed[indices]
+        fake_audio_embed = fake_audio_embed[indices]
+        real_audio_embed = real_audio_embed[indices]
+
+    fvd = frechet_distance(fake_video_embed, real_video_embed).item()
+    kvd = polynomial_mmd(fake_video_embed.cpu().numpy(), real_video_embed.cpu().numpy()).item()
+    fad = frechet_distance(fake_audio_embed, real_audio_embed).item() * 10000
+
+    return fvd, kvd, fad
+
 
 def calc_fvd_kvd_fad(
-    gt_video_list, pred_video_list, gt_audio_list, pred_audio_list, device="cuda:0", 
-    cat2indices: List[List[List[int]]] = None, eval_num=None, mode="vanilla", **kwargs
+    gt_video_list, pred_video_list, gt_audio_list, pred_audio_list, device="cuda:0", mode="vanilla", **kwargs
 ):
-    # Original code from "https: //github.com/researchmm/MM-Diffusion"
+    # Original code from "https://github.com/researchmm/MM-Diffusion"
     
     fvd_avcache_path = kwargs.get('fvd_avcache_path', None)
     if fvd_avcache_path is not None:
@@ -78,53 +98,106 @@ def calc_fvd_kvd_fad(
         embed_dict = {'real': gt_embed_dict}
 
     for t, loader in loader_dict.items():
-        video_embeds, audio_embeds, indices = [], [], []
-        cnt = 0
+        video_embeds, audio_embeds = [], []
         for _, sample in enumerate(tqdm(loader, desc=f'fvd_kvd_fad - {t}')):
             # b t h w c
             video_sample = sample['video'].to(device)
             audio_sample = sample['audio'].to(device)
-            index_sample = sample['index'].to(device)
 
             video_embed = get_fvd_logits(video_sample, i3d, device=device)
             video_embeds.append(video_embed)
-            indices.append(index_sample)
 
             _, audioclip_audio_embed, _ = get_audioclip_embeddings_scores(audioclip, video_sample, audio_sample)
             audio_embeds.append(audioclip_audio_embed)
 
-            cnt += video_sample.shape[0]
-            if eval_num and cnt >= eval_num: 
-                break
-        indices = torch.cat(indices).argsort()
-        video_embeds = torch.cat(video_embeds)[indices][:eval_num]
-        audio_embeds = torch.cat(audio_embeds)[indices][:eval_num]
+        video_embeds = torch.cat(video_embeds)
+        audio_embeds = torch.cat(audio_embeds)
 
         embed_dict[t] = {'video': video_embeds, 'audio': audio_embeds}
     
-    fvd = frechet_distance(embed_dict['fake']['video'], embed_dict['real']['video']).item()
-    kvd = polynomial_mmd(embed_dict['fake']['video'].cpu().numpy(), embed_dict['real']['video'].cpu().numpy()).item()
-    fad = frechet_distance(embed_dict['fake']['audio'], embed_dict['real']['audio']).item() * 10000
+    sample_num = min(len(embed_dict['fake']['video']), len(embed_dict['real']['video']))
+    fvd, kvd, fad = calc_fvd_kvd_fad_direct(embed_dict, list(range(sample_num)))
 
-    if cat2indices is not None:
-        fvd, kvd, fad = {'overall': fvd}, {'overall': kvd}, {'overall': fad}
-        for ai, index_list in enumerate(cat2indices):
-            fvd[ai], kvd[ai], fad[ai] = [], [], []
-            for ci, indices in enumerate(index_list):
-                fake_video_embed = embed_dict['fake']['video'][indices]
-                real_video_embed = embed_dict['real']['video'][indices]
-                fake_audio_embed = embed_dict['fake']['audio'][indices]
-                real_audio_embed = embed_dict['real']['audio'][indices]
+    return fvd, kvd, fad, embed_dict
 
-                fvd[ai].append(frechet_distance(fake_video_embed, real_video_embed).item())
-                kvd[ai].append(polynomial_mmd(fake_video_embed.cpu().numpy(), real_video_embed.cpu().numpy()).item())
-                fad[ai].append(frechet_distance(fake_audio_embed, real_audio_embed).item() * 10000)
 
-    return fvd, kvd, fad
+def calc_video_quality_score(pred_video_list, prompt_list, device='cuda:0', bs=8, 
+                             load_from_pretrained='./checkpoints/VideoReward'):
+    # Original code from "https://github.com/KwaiVGI/VideoAlign"
+
+    # weights will be automatically downloaded from huggingface
+    predictor = VideoVLMRewardInference(
+        load_from_pretrained=load_from_pretrained,
+        device=device
+    )
+
+    pred_video_list = [osp.abspath(path) for path in pred_video_list]
+    dataloader = create_dataloader(
+        metric='video-quality', 
+        video_path_list=pred_video_list,
+        prompt_list=prompt_list,
+        data_config=predictor.data_config,
+        processor=predictor.processor,
+        batch_size=bs,
+    )
+
+    visual_quality_score_list, motion_quality_score_list = [], []
+    for batch in tqdm(dataloader, desc='video-quality'):
+        batch = {k: v.to(predictor.device) if isinstance(v, torch.Tensor) else v \
+                  for k, v in batch.items()}
+        outputs = predictor.model(return_dict=True, **batch)["logits"]
+        outputs = predictor.post_process(outputs, use_norm=False)
+
+        visual_quality_scores = [r['VQ'] for r in outputs]
+        motion_quality_scores = [r['MQ'] for r in outputs]
+
+        visual_quality_score_list.extend(visual_quality_scores)
+        motion_quality_score_list.extend(motion_quality_scores)
+
+    visual_quality_scores = torch.tensor(visual_quality_score_list)
+    motion_quality_scores = torch.tensor(motion_quality_score_list)
+
+    return visual_quality_scores, motion_quality_scores
+
+
+def calc_audio_quality_score(pred_audio_list, prompt_list, max_audio_len_s=8.0,
+                             device='cuda:0', bs=8, audio_sr=16000):
+    # Original code from "https://github.com/facebookresearch/audiobox-aesthetics"
+
+    # weights will be automatically downloaded from huggingface
+    predictor = initialize_audio_aes_predictor()
+    predictor.model = predictor.model.to(device)
+    predictor.device = device
+
+    dataloader = create_dataloader(
+        metric='audio-quality', 
+        audio_path_list=pred_audio_list,
+        prompt_list=prompt_list,
+        sr=audio_sr,
+        backend="torchaudio",
+        mono=True,
+        keepdim=True,
+        norm=False,
+        resample=True,
+        max_audio_len_s=max_audio_len_s,
+        batch_size=bs,
+    )
+
+    score_list = []
+    for audios, prompts in tqdm(dataloader, desc='audio-quality'):
+        batch = [{"path": wav, "sample_rate": audio_sr} for wav in audios]
+        outputs = predictor.forward(batch)
+
+        scores = torch.tensor([np.mean([list(o.values())]) for o in outputs])
+        score_list.append(scores)
+    
+    audio_quality_scores = torch.cat(score_list)
+
+    return audio_quality_scores
 
 
 def calc_imagebind_score(video_list, audio_list, prompt_list, audio_prompt_list=None,
-                         device='cuda:0', cat2indices: List[List[List[int]]] = None, bs=1):
+                         device='cuda:0', bs=1):
     # Original code from "https://github.com/sonyresearch/svg_baseline"
 
     model = imagebind_model.imagebind_huge(pretrained=True)
@@ -133,53 +206,39 @@ def calc_imagebind_score(video_list, audio_list, prompt_list, audio_prompt_list=
 
     if audio_prompt_list is None:
         audio_prompt_list = prompt_list
-    text_embeds, audio_text_embeds, video_embeds, audio_embeds = [], [], [], []
-    for i in tqdm(range(0, len(video_list), bs), desc='ib_score'):
-        prompts = prompt_list[i:i+bs] + audio_prompt_list[i:i+bs]
-        videos, audios = video_list[i:i+bs], audio_list[i:i+bs]
-        inputs = {
-            ModalityType.TEXT: data.load_and_transform_text(prompts, device),
-            ModalityType.VISION: data.load_and_transform_video_data(videos, device),
-            ModalityType.AUDIO: data.load_and_transform_audio_data(audios, device),
-        }
+
+    dataloader = create_dataloader(
+        metric='imagebind-score', 
+        video_path_list=video_list,
+        audio_path_list=audio_list,
+        prompt_list=prompt_list,
+        audio_prompt_list=audio_prompt_list,
+        batch_size=8,
+    )
+
+    sim_tv_list, sim_ta_list, sim_av_list = [], [], []
+    cos = torch.nn.CosineSimilarity(dim=-1, eps=1e-6)
+    for inputs in tqdm(dataloader, desc='imagebind-score'):
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+        # [B, v+a, 77] -> [v+a, B, 77] -> [v*B+a*B, 77]
+        inputs[ModalityType.TEXT] = inputs[ModalityType.TEXT].transpose(0, 1).flatten(0, 1)
 
         with torch.no_grad():
             embeddings = model(inputs)
 
         text_embed, audio_text_embed = embeddings[ModalityType.TEXT].chunk(2, dim=0)
-        text_embeds.append(text_embed)
-        audio_text_embeds.append(audio_text_embed)
-        video_embeds.append(embeddings[ModalityType.VISION])
-        audio_embeds.append(embeddings[ModalityType.AUDIO])
+        video_embed, audio_embed = embeddings[ModalityType.VISION], embeddings[ModalityType.AUDIO]
+        sim_tv_list.append(cos(text_embed, video_embed).cpu())
+        sim_ta_list.append(cos(audio_text_embed, audio_embed).cpu())
+        sim_av_list.append(cos(audio_embed, video_embed).cpu())
 
-    text_embeds, audio_text_embeds = torch.cat(text_embeds), torch.cat(audio_text_embeds)
-    video_embeds, audio_embeds = torch.cat(video_embeds), torch.cat(audio_embeds)
+    sim_tv_scores, sim_ta_scores, sim_av_scores = \
+        torch.cat(sim_tv_list), torch.cat(sim_ta_list), torch.cat(sim_av_list)
 
-    cos = torch.nn.CosineSimilarity(dim=1, eps=1e-6)
-    sim_tv_list = cos(text_embeds, video_embeds)
-    sim_tv = sim_tv_list.mean().item()
-    sim_ta_list = cos(audio_text_embeds, audio_embeds)
-    sim_ta = sim_ta_list.mean().item()
-    sim_av_list = cos(video_embeds, audio_embeds)
-    sim_av = sim_av_list.mean().item()
-    
-    if cat2indices is not None:
-        sim_tv = {'overall': sim_tv, 'all': sim_tv_list.tolist()}
-        sim_ta = {'overall': sim_ta, 'all': sim_ta_list.tolist()}
-        sim_av = {'overall': sim_av, 'all': sim_av_list.tolist()}
-        for ai, index_list in enumerate(cat2indices):
-            sim_tv[ai], sim_ta[ai], sim_av[ai] = [], [], []
-            for ci, indices in enumerate(index_list):
-                text_embeds_sub, audio_text_embeds_sub, video_embeds_sub, audio_embeds_sub = \
-                    text_embeds[indices], audio_text_embeds[indices], video_embeds[indices], audio_embeds[indices]
-                sim_tv[ai].append(cos(text_embeds_sub, video_embeds_sub).mean().item())
-                sim_ta[ai].append(cos(audio_text_embeds_sub, audio_embeds_sub).mean().item())
-                sim_av[ai].append(cos(video_embeds_sub, audio_embeds_sub).mean().item())
-
-    return sim_tv, sim_ta, sim_av
+    return sim_tv_scores, sim_ta_scores, sim_av_scores
 
 
-def calc_clip_score(video_list, prompt_list, device='cuda:0', cat2indices=None, num_frames=48):
+def calc_clip_score(video_list, prompt_list, device='cuda:0', num_frames=48):
     # load clip model
     device = device
     model, preprocess = clip.load("ViT-B/32", device=device)
@@ -199,9 +258,9 @@ def calc_clip_score(video_list, prompt_list, device='cuda:0', cat2indices=None, 
         batch_size=1
     )
 
-    clip_score_list, indices_list = [], []
-    for frames, prompts, indices in tqdm(dataloader, desc='clipscore'):
-        assert frames.shape[0] == len(prompts) == len(indices) == 1  
+    clip_score_list = []
+    for frames, prompts in tqdm(dataloader, desc='clipscore'):
+        assert frames.shape[0] == len(prompts) == 1  
         frames = frames.to(device)
 
         with torch.no_grad():
@@ -212,25 +271,13 @@ def calc_clip_score(video_list, prompt_list, device='cuda:0', cat2indices=None, 
             text_features /= text_features.norm(dim=-1, keepdim=True)
             score = (image_features @ text_features.T).mean()
             clip_score_list.append(score.item())
-        indices_list.append(indices[0])
     
-    clip_scores = np.array(clip_score_list)
-    indices = np.array(indices_list)
-    clip_scores = clip_scores[indices.argsort()]
+    clip_scores = torch.tensor(clip_score_list)
 
-    clip_score = np.mean(clip_scores)
-
-    if cat2indices is not None:
-        clip_score = {'overall': clip_score, 'all': clip_scores.tolist()}
-        for ai, index_list in enumerate(cat2indices):
-            clip_score[ai] = []
-            for ci, indices in enumerate(index_list):
-                clip_score[ai].append(np.mean(clip_scores[indices]))
-
-    return clip_score
+    return clip_scores
 
 
-def calc_clap_score(audio_list, prompt_list, device='cuda:0', cat2indices=None):
+def calc_clap_score(audio_list, prompt_list, device='cuda:0'):
     # Original code from "https://github.com/sonyresearch/svg_baseline"
     model = ClapModel.from_pretrained("laion/clap-htsat-unfused").eval()
     processor = AutoProcessor.from_pretrained("laion/clap-htsat-unfused")
@@ -246,9 +293,9 @@ def calc_clap_score(audio_list, prompt_list, device='cuda:0', cat2indices=None):
         batch_size=1
     )
 
-    score_list, index_list = [], []
-    for audios, prompts, indices in tqdm(dataloader, desc='clapscore'):
-        assert len(audios) == len(prompts) == len(indices) == 1
+    score_list = []
+    for audios, prompts in tqdm(dataloader, desc='clapscore'):
+        assert len(audios) == len(prompts) == 1
         inputs = processor(text=prompts[0], audios=audios[0].squeeze(), 
                            return_tensors="pt", padding=True, 
                            sampling_rate=48000)   # CLAP requires sample_rate=48000
@@ -256,25 +303,14 @@ def calc_clap_score(audio_list, prompt_list, device='cuda:0', cat2indices=None):
         outputs = model(**inputs)
         scores = cos(outputs.text_embeds, outputs.audio_embeds).mean()
         score_list.append(scores)
-        index_list.append(indices)
     
-    indices = torch.cat(index_list).flatten()
-    clap_scores = torch.tensor(score_list)[indices.argsort()]
+    clap_scores = torch.tensor(score_list)
 
-    clap_score = clap_scores.mean().item()
-
-    if cat2indices is not None:
-        clap_score = {'overall': clap_score, 'all': clap_scores.tolist()}
-        for ai, index_list in enumerate(cat2indices):
-            clap_score[ai] = []
-            for ci, indices in enumerate(index_list):
-                clap_score[ai].append(torch.mean(clap_scores[indices]).item())
-
-    return clap_score
+    return clap_scores
 
 
-def calc_cavp_score(video_list, audio_list, device='cuda:0', cat2indices=None, sample_rate=16000,
-                    cavp_ckpt_path='./weights/cavp_epoch66.ckpt',
+def calc_cavp_score(video_list, audio_list, device='cuda:0', sample_rate=16000,
+                    cavp_ckpt_path='./checkpoints/cavp_epoch66.ckpt',
                     cavp_config_path='./configs/Stage1_CAVP.yaml'):
     # Original code from "https://github.com/sonyresearch/svg_baseline"
 
@@ -296,20 +332,19 @@ def calc_cavp_score(video_list, audio_list, device='cuda:0', cat2indices=None, s
     )
 
     tmp_path = "./tmp"
-    cavp_scores, indices_list = [], []
-    for video_paths, audios, truncate_seconds, indices in tqdm(dataloader, desc='cavpscore'):
-        assert len(video_paths) == len(audios) == len(truncate_seconds) == len(indices) == 1
+    score_list = []
+    for video_paths, audios, truncate_seconds in tqdm(dataloader, desc='cavpscore'):
+        assert len(video_paths) == len(audios) == len(truncate_seconds) == 1
 
         # Extract Video CAVP Features & New Video Path:
         try:  # TODO: debug
             cavp_feats, new_video_path = \
                 extract_cavp(video_paths[0], 0, truncate_seconds[0].item(), tmp_path=tmp_path)
         except:
-            cavp_scores.append(0.0)
-            indices_list.append(indices[0])
+            score_list.append(0.0)
             continue
 
-        spec = audios.unsqueeze(1).cuda().float()  # B x 1 x Mel x T
+        spec = audios.unsqueeze(1).to(device).float()  # B x 1 x Mel x T
         spec = spec.permute(0, 1, 3, 2)  # B x 1 x T x Mel
         spec_feat = extract_cavp.stage1_model.spec_encoder(spec)  # B x T x C
         spec_feat = extract_cavp.stage1_model.spec_project_head(
@@ -317,27 +352,16 @@ def calc_cavp_score(video_list, audio_list, device='cuda:0', cat2indices=None, s
         spec_feat = F.normalize(spec_feat, dim=-1)
 
         cos = nn.CosineSimilarity(dim=1, eps=1e-6)
-        score = cos(torch.from_numpy(cavp_feats).cuda(), spec_feat).mean().item()
+        score = cos(torch.from_numpy(cavp_feats).to(device), spec_feat).mean().item()
         
-        cavp_scores.append(score)
-        indices_list.append(indices[0])
+        score_list.append(score)
     
-    indices = torch.tensor(indices_list).flatten()
-    cavp_scores = torch.tensor(cavp_scores)[indices.argsort()]
+    cavp_scores = torch.tensor(score_list)
 
-    cavp_score = cavp_scores.mean().item()
-
-    if cat2indices is not None:
-        cavp_score = {'overall': cavp_score, 'all': cavp_scores.tolist()}
-        for ai, index_list in enumerate(cat2indices):
-            cavp_score[ai] = []
-            for ci, indices in enumerate(index_list):
-                cavp_score[ai].append(torch.mean(cavp_scores[indices]).item())
-
-    return cavp_score
+    return cavp_scores
 
 
-def calc_av_align(video_list, audio_list, cat2indices=None, size=None, return_score_list=False):
+def calc_av_align(video_list, audio_list, size=None):
     # Original code from "https://yzxing87.github.io/Seeing-and-Hearing/"
 
     dataloader = create_dataloader(
@@ -348,32 +372,17 @@ def calc_av_align(video_list, audio_list, cat2indices=None, size=None, return_sc
         batch_size=1
     )
 
-    align_score_list, index_list = [], []
-    for align_score, index in tqdm(dataloader, desc='av-align'):
+    align_score_list = []
+    for align_score in tqdm(dataloader, desc='av-align'):
         align_score_list.append(align_score)
-        index_list.append(index)
 
-    indices = torch.cat(index_list).argsort()
-    align_scores = torch.cat(align_score_list)[indices]
+    align_scores = torch.cat(align_score_list)
 
-    align_score = align_scores.mean().item()
-
-    if cat2indices is not None:
-        align_score = {'overall': align_score, 'all': align_scores.tolist()}
-        for ai, index_list in enumerate(cat2indices):
-            align_score[ai] = []
-            for ci, indices in enumerate(index_list):
-                align_score[ai].append(torch.mean(align_scores[indices]).item())
-
-    if return_score_list:
-        return align_score, align_scores
-    else:
-        return align_score
+    return align_scores
 
 
-def calc_av_score(video_list, audio_list, prompt_list, device='cuda:0', cat2indices=None,
-                  sample_rate=16000, window_size_s=0.5, window_overlap_s=0, topk_min=0.4,
-                  return_score_list=False):
+def calc_av_score(video_list, audio_list, prompt_list, device='cuda:0',
+                  sample_rate=16000, window_size_s=0.5, window_overlap_s=0, topk_min=0.4):
     
     model = imagebind_model.imagebind_huge(pretrained=True)
     model.eval()
@@ -390,10 +399,10 @@ def calc_av_score(video_list, audio_list, prompt_list, device='cuda:0', cat2indi
         batch_size=1
     )
 
-    avh_score_list, javis_score_list, index_list = [], [], []
+    avh_score_list, javis_score_list = [], []
     cos = nn.CosineSimilarity(dim=-1, eps=1e-6)
-    for avh_inputs, javis_inputs, video_windows_indices, index in tqdm(dataloader, desc='av-score'):
-        assert len(index) == video_windows_indices.shape[0] == 1
+    for avh_inputs, javis_inputs, video_windows_indices in tqdm(dataloader, desc='av-score'):
+        assert video_windows_indices.shape[0] == 1
 
         # image shape: (B,C,H,W), video shape: (B,15,C,2,H,W), audio shape(B,3,C,T,S), 
         avh_inputs = {k: v[0].to(device) for k, v in avh_inputs.items()}
@@ -428,128 +437,209 @@ def calc_av_score(video_list, audio_list, prompt_list, device='cuda:0', cat2indi
         
         javis_score_list.append(javis_score)
 
-        index_list.append(index[0])
-    
-    indices = torch.tensor(index_list).argsort()
-    avh_scores = torch.tensor(avh_score_list)[indices]
-    javis_scores = torch.tensor(javis_score_list)[indices]
+    avh_scores = torch.tensor(avh_score_list)
+    javis_scores = torch.tensor(javis_score_list)
 
-    avh_score, javis_score = avh_scores.mean().item(), javis_scores.mean().item()
+    return avh_scores, javis_scores
 
-    if cat2indices is not None:
-        avh_score = {'overall': avh_score, 'all': avh_scores.tolist()}
-        javis_score = {'overall': javis_score, 'all': javis_scores.tolist()}
-        for ai, index_list in enumerate(cat2indices):
-            avh_score[ai], javis_score[ai] = [], []
-            for ci, indices in enumerate(index_list):
-                avh_score[ai].append(torch.mean(avh_scores[indices]).item())
-                javis_score[ai].append(torch.mean(javis_scores[indices]).item())
 
-    if return_score_list:
-        return avh_score, javis_score, avh_scores, javis_scores
-    else:
-        return avh_score, javis_score
+def calc_desync_score(video_list, audio_list, max_length_s=8, device='cuda:0',
+                      syncformer_ckpt_path='./checkpoints/synchformer_state_dict.pth'):
+    # Original code from "https://github.com/hkchengrex/av-benchmark"
+
+    if not osp.exists(syncformer_ckpt_path):
+        print(f"Downloading SynchFormer weights to {syncformer_ckpt_path} ...")
+        os.makedirs(osp.dirname(syncformer_ckpt_path), exist_ok=True)
+        torch.hub.download_url_to_file(
+            "https://github.com/hkchengrex/MMAudio/releases/download/v0.1/synchformer_state_dict.pth",
+            syncformer_ckpt_path,
+            progress=True,
+        )
+
+    synchformer = Synchformer().to(device).eval()
+    sd = torch.load(syncformer_ckpt_path, weights_only=True)
+    synchformer.load_state_dict(sd)
+
+    dataloader = create_dataloader(
+        metric='desync-score', 
+        video_path_list=video_list,
+        audio_path_list=audio_list,
+        batch_size=8,
+        max_length_s=max_length_s
+    )
+
+    # TODO: compatible with Torch 2.4.0
+    sync_mel_spectrogram = torchaudio.transforms.MelSpectrogram(
+        sample_rate=16000,
+        win_length=400,
+        hop_length=160,
+        n_fft=1024,
+        n_mels=128,
+        wkwargs={'device': device}
+    )
+    mel_scale_fb = sync_mel_spectrogram.mel_scale.fb.to(device)
+    sync_mel_spectrogram.mel_scale.register_buffer('fb', mel_scale_fb)
+
+    # [-2.0, -1.8, ..., 0.0, ..., 1.8, 2.0], equals to `torch.linspace(-2, 2, 21)`
+    sync_grid = make_class_grid(-2, 2, 21)
+
+    desync_score_list = []
+    for video, audio in tqdm(dataloader, desc='desync'):
+        video, audio = video.to(device), audio.to(device)
+
+        ## Step1. Encode Video
+        # x: (B, T, C, H, W) H/W: 224
+        b, t, c, h, w = video.shape
+        assert c == 3 and h == 224 and w == 224
+
+        # partition the video
+        segment_size = 16
+        step_size = 8
+        num_segments = (t - segment_size) // step_size + 1
+        segments = []
+        for i in range(num_segments):
+            segments.append(video[:, i * step_size:i * step_size + segment_size])
+        vx = torch.stack(segments, dim=1)  # (B, S, T, C, H, W)
+
+        vx = rearrange(vx, 'b s t c h w -> (b s) 1 t c h w')
+        vx = synchformer.extract_vfeats(vx)
+        vx: torch.Tensor = rearrange(vx, '(b s) 1 t d -> b s t d', b=b)
+        
+        ## Step2. Encode Audio
+        assert audio.shape[0] == b
+        _, t = audio.shape
+
+        # partition the video
+        segment_size = 10240
+        step_size = 10240 // 2
+        num_segments = (t - segment_size) // step_size + 1
+        segments = []
+        for i in range(num_segments):
+            segments.append(audio[:, i * step_size:i * step_size + segment_size])
+        ax = torch.stack(segments, dim=1)  # (B, S, T, C, H, W)
+
+        ax = torch.log(sync_mel_spectrogram(ax) + 1e-6)
+        ax = pad_or_truncate(ax, 66)
+
+        mean = -4.2677393
+        std = 4.5689974
+        ax = (ax - mean) / (2 * std)
+        # ax: B * S * 128 * 66
+        ax: torch.Tensor = synchformer.extract_afeats(ax.unsqueeze(2))
+
+        ## Step3. Calculate DeSync Score
+        batch_sync_scores = []
+        assert (frame_num := vx.shape[1]) == ax.shape[1]
+        segment_size = 14
+
+        segment_num = math.ceil(frame_num / segment_size)
+        for si in range(segment_num):
+            fstart, fend = si * segment_size, min((si + 1) * segment_size, frame_num)
+            vx_segment, ax_segment = vx[:, fstart:fend], ax[:, fstart:fend]
+            flen = fend - fstart
+
+            delta_frame = segment_size - flen
+            if delta_frame > 0:
+                if si == 0:
+                    repeat_ = math.ceil(delta_frame / flen)
+                    video_pad = vx_segment.repeat(1, repeat_, *([1] * (vx_segment.dim() - 2)))
+                    video_pad = video_pad[:, :delta_frame, ...]
+                    vx_segment = torch.cat((vx_segment, video_pad), dim=1)
+                    audio_pad = ax_segment.repeat(1, repeat_, *([1] * (ax_segment.dim() - 2)))
+                    audio_pad = audio_pad[:, :delta_frame, ...]
+                    ax_segment = torch.cat((ax_segment, audio_pad), dim=1)
+                else:
+                    assert si == segment_num - 1
+                    vx_segment, ax_segment = vx[:, -segment_size:], ax[:, -segment_size:]
+            
+            # shape (B, 21)
+            logits = synchformer.compare_v_a(vx_segment, ax_segment)
+            top_id = torch.argmax(logits, dim=-1).cpu().numpy()
+            # shape (B, )
+            for j in range(vx_segment.shape[0]):
+                batch_sync_scores.append(abs(sync_grid[top_id[j]].item()))
+        
+        batch_sync_scores = torch.tensor(batch_sync_scores)
+        batch_sync_scores = batch_sync_scores.reshape(b, -1).mean(dim=1)
+        desync_score_list.append(batch_sync_scores)
+
+    desync_scores = torch.cat(desync_score_list)
+
+    return desync_scores
 
 
 def calc_audio_score(gt_audio_list, pred_audio_list, prompt_list, device='cuda:0', 
-                     eval_num=None, bs=8, **kwargs):
-    ############### Part I - FAD ###############
-    from .AudioCLIP.get_embedding import preprocess_audio
+                     exist_metrics={}, bs=8, **kwargs):
+    # calculate "fad", "quality", "ib_ta", "clap" for audio_score
 
-    audioclip = load_audioclip_pretrained(device)
+    # Part I
+    if "fad" not in exist_metrics or kwargs.get('force_eval', False):
+        from .AudioCLIP.get_embedding import preprocess_audio
 
-    real_loader, fake_loader = create_dataloader_for_fvd_vanilla(
-        gt_audio_list, gt_audio_list, pred_audio_list, pred_audio_list, 
-        audio_sr=kwargs.pop('audio_sr'),
-        num_workers=kwargs.pop('num_workers'),
-        audio_only=True,
-        **kwargs
-    )
+        audioclip = load_audioclip_pretrained(device)
 
-    loader_dict = {'real': real_loader, 'fake': fake_loader}
-    embed_dict = {}
-    for t, loader in loader_dict.items():
-        audio_embeds = []
-        cnt = 0
-        for _, sample in enumerate(tqdm(loader, desc=f'fad: {t}')):
-            audio_sample = sample['audio'].to(device)
+        real_loader = create_dataloader_for_fvd_vanilla(gt_audio_list, gt_audio_list, audio_only=True, **kwargs)
+        fake_loader = create_dataloader_for_fvd_vanilla(pred_audio_list, pred_audio_list, audio_only=True, **kwargs)
 
-            audios = preprocess_audio(audio_sample).to(device)
+        loader_dict = {'real': real_loader, 'fake': fake_loader}
+        embed_dict = {}
+        for t, loader in loader_dict.items():
+            audio_embeds = []
+            for _, sample in enumerate(tqdm(loader, desc=f'fad: {t}')):
+                audio_sample = sample['audio'].to(device)
+
+                audios = preprocess_audio(audio_sample).to(device)
+
+                with torch.no_grad():
+                    audioclip_audio_embed = audioclip(audio=audios, video=None)[0][0][0]
+                assert audio_sample.shape[0] == audioclip_audio_embed.shape[0]
+                
+                audio_embeds.append(audioclip_audio_embed)
+
+            embed_dict[t] = torch.cat(audio_embeds)
+        
+        sample_num = min(len(embed_dict['fake']), len(embed_dict['real']))
+        fad = frechet_distance(
+            embed_dict['fake'][:sample_num], embed_dict['real'][:sample_num]
+        ).item() * 10000
+        exist_metrics["fad"] = fad
+    
+    # Part II
+    if "quality" not in exist_metrics or kwargs.get('force_eval', False):
+        max_length_s = kwargs.get('max_audio_len_s', 8.0)
+        audio_quality = calc_audio_quality_score(pred_audio_list, prompt_list, max_length_s, device, bs=bs)
+        exist_metrics["quality"] = audio_quality.mean().item()
+    
+    # Part III
+    if "ib_ta" not in exist_metrics or kwargs.get('force_eval', False):
+        model = imagebind_model.imagebind_huge(pretrained=True)
+        model.eval()
+        model.to(device)
+
+        text_embeds, audio_embeds = [], []
+        # fast enough in a for-loop
+        for i in tqdm(range(0, len(pred_audio_list), bs), desc='ib_score'):
+            prompts, audios = prompt_list[i:i+bs], pred_audio_list[i:i+bs]
+            inputs = {
+                ModalityType.TEXT: imagebind_data.load_and_transform_text(prompts, device),
+                ModalityType.AUDIO: imagebind_data.load_and_transform_audio_data(audios, device),
+            }
 
             with torch.no_grad():
-                audioclip_audio_embed = audioclip(audio=audios, video=None)[0][0][0]
-            assert audio_sample.shape[0] == audioclip_audio_embed.shape[0]
-            
-            audio_embeds.append(audioclip_audio_embed)
+                embeddings = model(inputs)
 
-            cnt += audio_sample.shape[0]
-            if eval_num and cnt >= eval_num: 
-                break
+            text_embeds.append(embeddings[ModalityType.TEXT])
+            audio_embeds.append(embeddings[ModalityType.AUDIO])
 
-        embed_dict[t] = torch.cat(audio_embeds)
+        text_embeds, audio_embeds = torch.cat(text_embeds), torch.cat(audio_embeds)
+
+        cos = torch.nn.CosineSimilarity(dim=1, eps=1e-6)
+        sim_ta = cos(text_embeds, audio_embeds).mean().item()
+        exist_metrics["ib_ta"] = sim_ta
     
-    fad = frechet_distance(embed_dict['fake'], embed_dict['real']).item() * 10000
-    ############### Part I - FAD ###############
-
-
-    ############### Part II - IB_TA ###############
-    model = imagebind_model.imagebind_huge(pretrained=True)
-    model.eval()
-    model.to(device)
-
-    text_embeds, audio_embeds = [], []
-    # fast enough in a for-loop
-    for i in tqdm(range(0, len(pred_audio_list), bs), desc='ib_score'):
-        prompts, audios = prompt_list[i:i+bs], pred_audio_list[i:i+bs]
-        inputs = {
-            ModalityType.TEXT: data.load_and_transform_text(prompts, device),
-            ModalityType.AUDIO: data.load_and_transform_audio_data(audios, device),
-        }
-
-        with torch.no_grad():
-            embeddings = model(inputs)
-
-        text_embeds.append(embeddings[ModalityType.TEXT])
-        audio_embeds.append(embeddings[ModalityType.AUDIO])
-
-    text_embeds, audio_embeds = torch.cat(text_embeds), torch.cat(audio_embeds)
-
-    cos = torch.nn.CosineSimilarity(dim=1, eps=1e-6)
-    sim_ta = cos(text_embeds, audio_embeds).mean().item()
-    ############### Part II - IB_TA ###############
+    # Part IV
+    if "clap" not in exist_metrics or kwargs.get('force_eval', False):
+        clap_score = calc_clap_score(pred_audio_list, prompt_list, device)
+        exist_metrics["clap"] = clap_score.mean().item()
     
-
-    ############### Part III - CLAP ###############
-    model = ClapModel.from_pretrained("laion/clap-htsat-unfused").eval()
-    processor = AutoProcessor.from_pretrained("laion/clap-htsat-unfused")
-    model.to(device=device)
-    cos = torch.nn.CosineSimilarity(dim=1, eps=1e-6)
-
-    dataloader = create_dataloader(
-        metric='clap-score', 
-        audio_path_list=pred_audio_list,
-        prompt_list=prompt_list,
-        sr=48000,   # CLAP requires sample_rate=48000
-        max_audio_len_s=None,
-        batch_size=1
-    )
-
-    score_list, index_list = [], []
-    for audios, prompts, indices in tqdm(dataloader, desc='clapscore'):
-        assert len(audios) == len(prompts) == len(indices) == 1
-        inputs = processor(text=prompts[0], audios=audios[0].squeeze(), 
-                           return_tensors="pt", padding=True, 
-                           sampling_rate=48000)  # CLAP requires sample_rate=48000
-        inputs.to(device=device)
-        outputs = model(**inputs)
-        scores = cos(outputs.text_embeds, outputs.audio_embeds).mean()
-        score_list.append(scores)
-        index_list.append(indices)
-    
-    indices = torch.cat(index_list).flatten()
-    clap_scores = torch.tensor(score_list)[indices.argsort()]
-
-    clap_score = clap_scores.mean().item()
-    ############### Part III - CLAP ###############
-
-    return fad, sim_ta, clap_score
+    return 

@@ -8,6 +8,7 @@ warnings.filterwarnings('ignore')
 import colossalai
 import torch
 import torch.distributed as dist
+from peft import PeftModel
 from colossalai.cluster import DistCoordinator
 from mmengine.runner import set_random_seed
 from tqdm import tqdm
@@ -60,7 +61,8 @@ def main():
     if is_distributed():
         colossalai.launch_from_torch({})
         coordinator = DistCoordinator()
-        enable_sequence_parallelism = coordinator.world_size > 1
+        enable_sequence_parallelism = coordinator.world_size > 1 and \
+            cfg.get('enable_sequence_parallelism', False)
         if enable_sequence_parallelism:
             set_sequence_parallel_group(dist.group.WORLD)
     else:
@@ -73,6 +75,8 @@ def main():
     logger.info("Inference configuration:\n %s", pformat(cfg.to_dict()))
     verbose = cfg.get("verbose", 1)
     progress_wrap = tqdm if verbose == 1 else (lambda x: x)
+
+    torch.set_num_threads(1) # NOTE: without it, loading audioldm2 is really really slow
 
     # ======================================================
     # build model & load weights
@@ -100,6 +104,7 @@ def main():
     # == build diffusion model ==
     input_size = (num_frames, *image_size)
     v_latent_size = vae.get_latent_size(input_size)  # [t//4 for every 17 frame, h//8, w//8]
+    ckpt_path = cfg.model.pop('weight_init_from', cfg.get('model_path', ''))
     model = (
         build_module(
             cfg.model,
@@ -109,8 +114,7 @@ def main():
             caption_channels=text_encoder.output_dim,
             model_max_length=text_encoder.model_max_length,
             enable_sequence_parallelism=enable_sequence_parallelism,
-            from_pretrained=cfg.get('model_path', cfg.model.get('from_pretrained')),
-            weight_init_from=cfg.model.get('weight_init_from', {}),
+            weight_init_from=ckpt_path,
         )
         .to(device, dtype)
         .eval()
@@ -118,6 +122,13 @@ def main():
     text_encoder.y_embedder = model.y_embedder  # HACK: for classifier-free guidance
     if prior_encoder is not None:
         prior_encoder.st_prior_embedder = model.st_prior_embedder
+    
+    lora_ckpt_path = os.path.join(ckpt_path, cfg.get("lora_dir", "lora"))
+    if cfg.get('lora_enabled', True) and os.path.exists(lora_ckpt_path):
+        logger.info(f'Loading LoRA weight from {lora_ckpt_path}')
+        model = PeftModel.from_pretrained(model, lora_ckpt_path, is_trainable=False)
+        logger.info("Merging LoRA weights...")
+        model = model.merge_and_unload()
 
     # == build scheduler ==
     scheduler = build_module(cfg.scheduler, SCHEDULERS)
@@ -130,7 +141,8 @@ def main():
     start_idx = cfg.get("start_index", 0)
     if prompts is None:
         if cfg.get("prompt_path", None) is not None:
-            prompts = load_prompts(cfg.prompt_path, start_idx, cfg.get("end_index", None))
+            prompts = load_prompts(cfg.prompt_path, start_idx, cfg.get("end_index", None),
+                                   prompt_key=cfg.get("prompt_key", "text"))
         else:
             prompts = [cfg.get("prompt_generator", "")] * 1_000_000  # endless loop
     elif isinstance(prompts, str):
@@ -147,6 +159,17 @@ def main():
     assert len(reference_path) == len(prompts), "Length of reference must be the same as prompts"
     assert len(mask_strategy) == len(prompts), "Length of mask_strategy must be the same as prompts"
 
+    # == prepare distributed inference ==
+    if is_distributed() and not enable_sequence_parallelism:
+        local_rank = dist.get_rank()
+        num_per_rank = math.ceil(len(prompts) / coordinator.world_size)
+        local_start_idx = local_rank * num_per_rank
+        local_end_idx = local_start_idx + num_per_rank
+        prompts = prompts[local_start_idx:local_end_idx]
+        reference_path = reference_path[local_start_idx:local_end_idx]
+        mask_strategy = mask_strategy[local_start_idx:local_end_idx]
+        start_idx += local_start_idx
+
     # == prepare arguments ==
     fps = cfg.fps
     save_fps = cfg.get("save_fps", fps // cfg.get("frame_interval", 1))
@@ -159,6 +182,10 @@ def main():
     align = cfg.get("align", None)
     assert loop == 1, "not implemented"
     audio_fps = cfg.get("audio_fps", 16000)
+    neg_prompts = cfg.get("neg_prompt", None)
+    if isinstance(neg_prompts, str):
+        neg_prompts = [neg_prompts] * len(prompts)
+    use_text_preprocessing = cfg.get("use_text_preprocessing", True)
 
     save_dir = cfg.save_dir
     os.makedirs(save_dir, exist_ok=True)
@@ -171,6 +198,7 @@ def main():
         batch_prompts = prompts[i : i + batch_size]
         ms = mask_strategy[i : i + batch_size]
         refs = reference_path[i : i + batch_size]
+        neg_prompts_batch = neg_prompts[i : i + batch_size] if neg_prompts is not None else None
 
         # == get json from prompts ==
         batch_prompts, refs, ms = extract_json_from_prompts(batch_prompts, refs, ms, noimpl=True)
@@ -200,7 +228,7 @@ def main():
                 )
                 for idx in range(len(batch_prompts))
             ]
-            if coordinator and coordinator.world_size > 1:
+            if enable_sequence_parallelism and coordinator.world_size > 1:
                 dist.barrier()
             if all(os.path.exists(f'{_path}.mp4') for _path in save_paths):
                 continue
@@ -268,7 +296,10 @@ def main():
 
             # 3. clean prompt with T5
             for idx, prompt_segment_list in enumerate(batched_prompt_segment_list):
-                batched_prompt_segment_list[idx] = [text_preprocessing(prompt) for prompt in prompt_segment_list]
+                batched_prompt_segment_list[idx] = [
+                    text_preprocessing(prompt, use_text_preprocessing=use_text_preprocessing) \
+                        for prompt in prompt_segment_list
+                ]
 
             # 4. merge to obtain the final prompt
             batch_prompts = []
@@ -289,7 +320,8 @@ def main():
                     )
 
                 # == sampling ==
-                # torch.manual_seed(1024)  ## TODO: fix or not
+                if cfg.get('fix_noise_seed', False):
+                    torch.manual_seed(1024)  ## TODO: fix or not
                 vz = torch.randn(len(batch_prompts), vae.out_channels, *v_latent_size, device=device, dtype=dtype)
                 audio_length_in_s = num_frames / fps
                 az, original_waveform_length = audio_vae.prepare_latents(audio_length_in_s, len(batch_prompts), device=device, dtype=dtype)
@@ -306,6 +338,7 @@ def main():
                     progress=verbose >= 2,
                     mask=masks,
                     prior_encoder=prior_encoder,
+                    neg_prompts=neg_prompts_batch
                 )
                 video_samples, audio_samples = samples['video'], samples['audio']
                 
@@ -315,7 +348,7 @@ def main():
                 audio_clips.append(audio_samples)
 
             # == save samples ==
-            if is_main_process():
+            if not enable_sequence_parallelism or is_main_process():
                 for idx, batch_prompt in enumerate(batch_prompts):
                     if verbose >= 2:
                         logger.info("Prompt: %s", batch_prompt)
@@ -342,7 +375,7 @@ def main():
                         add_watermark(save_path)
         start_idx += len(batch_prompts)
     logger.info("Inference finished.")
-    logger.info("Saved %s samples to %s", start_idx, save_dir)
+    logger.info("Saved %s samples to %s", len(prompts), save_dir)
 
 
 if __name__ == "__main__":

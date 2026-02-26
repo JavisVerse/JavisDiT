@@ -27,19 +27,24 @@ IMG_FPS = 120
 def load_video_audio_transform(
     video_path, direct_load_video_clip, num_frames, frame_interval,
     audio_path, audio_fps, aframes, unpaired_audio_path,
-    video_transform, audio_transform, augmenter, require_onset
+    video_transform, audio_transform, augmenter, require_onset,
+    video_fps=24, fix_start_frame=None
 ):
     # loading
     if not direct_load_video_clip:
         vframes, vinfo = read_video(video_path, backend="av")
+        if fix_start_frame is not None:
+            vframes = vframes[min(fix_start_frame, max(len(vframes)-num_frames, 0)):]
         total_frames = len(vframes)
     else:
         assert num_frames is not None  # double-check
-        vframes, vinfo = read_video(video_path, backend="cv2", 
-                                    num_frames=num_frames, frame_interval=frame_interval)
+        vframes, vinfo = read_video(
+            video_path, backend="cv2", 
+            num_frames=num_frames, frame_interval=frame_interval, fix_start_frame=fix_start_frame
+        )
         total_frames = vinfo.pop('total_frames')
         start_frame_ind, end_frame_ind = vinfo.pop('start_frame_ind'), vinfo.pop('end_frame_ind')
-    video_fps = vinfo["video_fps"] if "video_fps" in vinfo else 24
+    video_fps = vinfo.get('video_fps', video_fps)
 
     # align video and audio
     video_duration = total_frames / video_fps
@@ -69,11 +74,12 @@ def load_video_audio_transform(
     video = video_transform(video)  # T C H W
 
     # augment after video transform but before audio transform
-    va_info.update({
-        'video_path': video_path, 'video_fps': video_fps, 
-        'audio_path': audio_path, 'audio_fps': audio_fps, 'unpaired_audio_path': unpaired_audio_path
-    })
     if augmenter:
+        va_info.update({
+            'video_path': video_path, 'video_fps': video_fps, 
+            'audio_path': audio_path, 'audio_fps': audio_fps, 
+            'unpaired_audio_path': unpaired_audio_path
+        })
         neg_videos, neg_audios = augmenter(video, audio, va_info)
     else:
         neg_videos, neg_audios = None, None
@@ -417,22 +423,39 @@ class VariableVideoAudioTextDataset(VariableVideoTextDataset):
         self.neg_aug = neg_aug
         self.direct_load_video_clip = direct_load_video_clip
 
+        self.default_video_fps = kwargs.get('default_video_fps', 24)
+        self.scale_factor = kwargs.get('scale_factor', 1)
+        self.use_audio_in_video = kwargs.get('use_audio_in_video', False)
+        if self.use_audio_in_video:
+            self.data['audio_path'] = self.data['path']
+        self.dpo_enabled = kwargs.get('dpo_enabled', False)
+        if self.dpo_enabled and self.use_audio_in_video:
+            self.data['audio_path_reject'] = self.data['path_reject']
+
     def getitem(self, index):
         # a hack to pass in the (time, height, width) info from sampler
         index, num_frames, height, width = [int(val) for val in index.split("-")]
-        # return torch.load(os.path.join(self.buffer_dir, f'{index}.bin')) # debug
+        # return torch.load(os.path.join(self.buffer_dir, f'{index}.bin')) # debug 
+        height = (height + self.scale_factor - 1) // self.scale_factor * self.scale_factor
+        width = (width + self.scale_factor - 1) // self.scale_factor * self.scale_factor
 
         sample = self.data.iloc[index]
         path = sample["path"]
-        file_type = self.get_type(path)
+        # file_type = self.get_type(path)
         ar = height / width
 
         audio_path = sample.get('audio_path', None)
-        aframes, ainfo = read_audio(audio_path, backend='auto')
-        audio_fps = ainfo.get("audio_fps", 16000)
-        assert audio_fps == sample["audio_fps"], audio_fps
+        audio_fps = sample.get('audio_fps', 16000)
+        aframes, ainfo = read_audio(audio_path, sr=audio_fps, backend='auto')
+        assert ainfo["audio_fps"] == audio_fps, ainfo["audio_fps"]
 
-        video_fps = 24  # default fps
+        if self.dpo_enabled:
+            path_reject = sample["path_reject"]
+            audio_path_reject = sample["audio_path_reject"]
+            aframes_reject, ainfo_reject = read_audio(audio_path_reject, sr=audio_fps, backend='auto')
+            assert ainfo_reject["audio_fps"] == audio_fps, ainfo_reject["audio_fps"]
+
+        video_fps = self.default_video_fps
         if self.audio_only:
             duration = num_frames / video_fps
             num_audio_frames = int(duration * audio_fps)  # lower bound
@@ -440,15 +463,26 @@ class VariableVideoAudioTextDataset(VariableVideoTextDataset):
             audio = self.audio_transform(audio, duration=duration)
             video = None
             neg_videos, neg_audios = None, None
-        elif file_type == "video":
+            if self.dpo_enabled:
+                audio_reject = temporal_random_crop(aframes_reject, num_audio_frames, 1)
+                audio_reject = self.audio_transform(audio_reject, duration=duration)
+                video_reject = None
+        elif self.get_type(path) == "video":
             video_fps, video, audio, onset, neg_videos, neg_audios = load_video_audio_transform(
                 path, self.direct_load_video_clip, num_frames, self.frame_interval, 
                 audio_path, audio_fps, aframes, sample.get("unpaired_audio_path", None), 
                 get_transforms_video(self.transform_name, (height, width)), self.audio_transform, self.augmenter,
                 self.require_onset
             )
+            if self.dpo_enabled:
+                _, video_reject, audio_reject, _, _, _ = load_video_audio_transform(
+                    path_reject, self.direct_load_video_clip, num_frames, self.frame_interval, 
+                    audio_path_reject, audio_fps, aframes_reject, sample.get("unpaired_audio_path", None), 
+                    get_transforms_video(self.transform_name, (height, width)), self.audio_transform, self.augmenter,
+                    self.require_onset
+                )
         else:
-            raise NotImplementedError(file_type)
+            raise NotImplementedError(self.get_type(path))
             # loading
             image = pil_loader(path)
             video_fps = IMG_FPS
@@ -479,11 +513,17 @@ class VariableVideoAudioTextDataset(VariableVideoTextDataset):
         }
         if self.require_onset:
             ret.update({"onset": onset, })    # audio peak,
-        if neg_videos:
+        if neg_videos is not None:
             # NTCHW -> NCTHW
             for aug_type, aug_video in neg_videos.items():
                 neg_videos[aug_type] = aug_video.permute(0, 2, 1, 3, 4)
             ret.update({"neg_videos": neg_videos, "neg_audios": neg_audios})
+        if self.dpo_enabled:
+            if audio_reject is not None:
+                ret.update({"audio_reject": audio_reject})
+            if video_reject is not None:
+                video_reject = video_reject.permute(1, 0, 2, 3)
+                ret.update({"video_reject": video_reject})
 
         if self.get_text:
             ret["text"] = sample["text"]

@@ -1,14 +1,20 @@
 import os
 import os.path as osp
 import json
+from collections.abc import Mapping
+from dataclasses import dataclass
+from typing import Dict, Optional, Sequence, List, Tuple, Union
 
 import cv2
 from moviepy.editor import VideoFileClip
 from PIL import Image
+from torio.io import StreamingMediaDecoder
+from transformers import AutoProcessor
 
 import torch
 from torch.utils.data import DataLoader, Dataset
 import torchvision.transforms as transforms
+from torchvision.transforms import v2 as transforms_v2
 import torchaudio
 from pytorchvideo import transforms as pv_transforms
 from pytorchvideo.data.clip_sampling import ConstantClipsPerVideoSampler
@@ -16,14 +22,16 @@ from torchvision.transforms._transforms_video import NormalizeVideo
 
 import sys
 sys.path.append(os.path.join(os.path.dirname(__file__), ".", "ImageBind"))
-from .ImageBind.imagebind import data
+from .ImageBind.imagebind import data as imagebind_data
 from .ImageBind.imagebind.models.imagebind_model import ModalityType
 from .wav2spec import get_spectrogram
 from .av_align import (
     detect_audio_peaks, extract_frames, detect_video_peaks, 
     calc_intersection_over_union
 )
-from .utils import ResizeAndPad, read_video, read_audio
+from .VideoAlign.prompt_template import build_prompt
+from .VideoAlign.vision_process import process_vision_info
+from .utils import ResizeAndPad, read_video, read_audio, smart_pad
 
 
 class FVDFADDataset(Dataset):
@@ -46,7 +54,7 @@ class FVDFADDataset(Dataset):
             audio_path = self.audio_list[idx]
             audio_data = read_audio(audio_path, sr=self.audio_sr, 
                                     max_audio_len_s=self.max_audio_len_s, padding=True)
-            return {"audio":audio_data, "index": idx}
+            return {"audio":audio_data}
 
         # load video&audio pair from list
         video_path = self.video_list[idx]
@@ -64,7 +72,7 @@ class FVDFADDataset(Dataset):
 
         # return video&audio pair
         video_data = ((video_data + 1) * 127.5).clamp(0, 255).to(torch.uint8)
-        return {"video": video_data, "audio": audio_data, "index": idx}
+        return {"video": video_data, "audio": audio_data}
     
 
 class VideoFrameDataset(Dataset):
@@ -91,7 +99,7 @@ class VideoFrameDataset(Dataset):
 
         prompt = self.prompt_list[index]
 
-        return video, prompt, index
+        return video, prompt
 
 
 class AudioDataset(Dataset):
@@ -107,6 +115,7 @@ class AudioDataset(Dataset):
 
         self.audio_transform = audio_transform
         self.ta_processor = ta_processor
+        self.load_kwargs = kwargs
     
     def __len__(self):
         return len(self.audio_path_list)
@@ -115,10 +124,73 @@ class AudioDataset(Dataset):
         audio_path = self.audio_path_list[index]
 
         audio = read_audio(audio_path, self.sr, self.max_audio_len_s, self.padding, 
-                           audio_transform=self.audio_transform)
+                           audio_transform=self.audio_transform, **self.load_kwargs)
         prompt = self.prompt_list[index]
 
-        return audio, prompt, index
+        return audio, prompt
+
+
+class VideoAlignDataset(Dataset):
+    """load video frames
+    """
+    def __init__(self, video_path_list, prompt_list, data_config):
+        super().__init__()
+        assert len(video_path_list) == len(prompt_list)
+        self.video_path_list = video_path_list
+        self.prompt_list = prompt_list
+        self.data_config = data_config
+    
+    def __len__(self):
+        return len(self.video_path_list)
+
+    def __getitem__(self, index):
+        video_path = self.video_path_list[index]
+        prompt = self.prompt_list[index]
+
+        fps = self.data_config.fps
+        num_frames = self.data_config.num_frames
+        max_pixels = self.data_config.max_frame_pixels
+
+        if num_frames is None:
+            chat_data = [
+                [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "video", 
+                                "video": f"file://{video_path}", 
+                                "max_pixels": max_pixels, 
+                                "fps": fps,
+                                "sample_type": self.data_config.sample_type,
+                            },
+                            {"type": "text", "text": build_prompt(prompt, self.data_config.eval_dim, self.data_config.prompt_template_type)},
+                        ],
+                    },
+                ]
+            ]
+        else:
+            chat_data = [
+                [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "video",
+                                "video": f"file://{video_path}", 
+                                "max_pixels": max_pixels, 
+                                "nframes": num_frames,
+                                "sample_type": self.data_config.sample_type,
+                            },
+                            {"type": "text", "text": build_prompt(prompt, self.data_config.eval_dim, self.data_config.prompt_template_type)},
+                        ],
+                    },
+                ]
+            ]
+        image_inputs, video_inputs = process_vision_info(chat_data)
+        assert image_inputs is None
+        
+        return chat_data, video_inputs
 
 
 class CavpDataset(Dataset):
@@ -143,7 +215,34 @@ class CavpDataset(Dataset):
 
         audio = get_spectrogram(audio_path, self.sr * truncate_second)[1]
 
-        return video_path, audio, truncate_second, index
+        return video_path, audio, truncate_second
+
+
+class ImageBindDataset(Dataset):
+    def __init__(self, video_path_list, audio_path_list, prompt_list, audio_prompt_list=None):
+        super().__init__()
+        assert len(video_path_list) == len(audio_path_list) == len(prompt_list)
+        self.video_path_list = video_path_list
+        self.audio_path_list = audio_path_list
+        self.prompt_list = prompt_list
+        self.audio_prompt_list = audio_prompt_list or prompt_list
+
+    def __len__(self):
+        return len(self.video_path_list)
+    
+    def __getitem__(self, index):
+        video_path = self.video_path_list[index]
+        audio_path = self.audio_path_list[index]
+        prompt = self.prompt_list[index]
+        audio_prompt = self.audio_prompt_list[index]
+
+        inputs = {
+            ModalityType.TEXT: imagebind_data.load_and_transform_text([prompt, audio_prompt], 'cpu'),
+            ModalityType.VISION: imagebind_data.load_and_transform_video_data([video_path], 'cpu')[0],
+            ModalityType.AUDIO: imagebind_data.load_and_transform_audio_data([audio_path], 'cpu')[0],
+        }
+
+        return inputs
 
 
 class AVAlignDataset(Dataset):
@@ -168,7 +267,7 @@ class AVAlignDataset(Dataset):
                 
         av_align_score = calc_intersection_over_union(audio_peaks, video_peaks, fps)
 
-        return av_align_score, index
+        return av_align_score
 
 
 class AVScoreDataset(Dataset):
@@ -232,7 +331,7 @@ class AVScoreDataset(Dataset):
         
         avh_inputs = {
             ModalityType.VISION: video_frames,
-            ModalityType.AUDIO: data.load_and_transform_audio_data([audio_path], 'cpu'),
+            ModalityType.AUDIO: imagebind_data.load_and_transform_audio_data([audio_path], 'cpu'),
         }
 
         waveform, sr = torchaudio.load(audio_path)
@@ -252,7 +351,7 @@ class AVScoreDataset(Dataset):
             ModalityType.AUDIO: audio_clips,
         }
 
-        return avh_inputs, javis_inputs, video_windows_indices, index
+        return avh_inputs, javis_inputs, video_windows_indices
 
     def segment_clip_transform(self, frames, wavform, fps):
         video_window_size = int(self.window_size_s * fps)
@@ -298,7 +397,7 @@ class AVScoreDataset(Dataset):
         clip_sampler = ConstantClipsPerVideoSampler(
             clip_duration=clip_duration, clips_per_video=clips_per_video
         )
-        all_clips_timepoints = data.get_clip_timepoints(
+        all_clips_timepoints = imagebind_data.get_clip_timepoints(
             clip_sampler, waveform.size(1) / self.sample_rate
         )
         all_clips = []
@@ -308,7 +407,7 @@ class AVScoreDataset(Dataset):
                 int(clip_timepoints[0] * self.sample_rate) : 
                 int(clip_timepoints[1] * self.sample_rate)
             ]
-            waveform_melspec = data.waveform2melspec(
+            waveform_melspec = imagebind_data.waveform2melspec(
                 waveform_clip, self.sample_rate, num_mel_bins, target_length
             )
             all_clips.append(waveform_melspec)
@@ -318,6 +417,78 @@ class AVScoreDataset(Dataset):
         all_clips = torch.stack(all_clips, dim=0)
 
         return all_clips
+
+
+class DeSyncDataset(Dataset):
+    def __init__(self, video_path_list, audio_path_list, 
+                 size=224, video_fps=25.0, audio_sr=16000, max_length_s=8.0):
+        super().__init__()
+        assert len(video_path_list) == len(audio_path_list)
+        self.video_path_list = video_path_list
+        self.audio_path_list = audio_path_list
+        self.size = size
+        self.video_fps = video_fps
+        self.audio_sr = audio_sr
+        self.max_length_s = max_length_s
+
+        self.expected_video_length = int(video_fps * max_length_s)
+        self.expected_audio_length = int(audio_sr * max_length_s)
+
+        self.video_transform = transforms_v2.Compose([
+            transforms_v2.Resize(self.size, interpolation=transforms_v2.InterpolationMode.BICUBIC),
+            transforms_v2.CenterCrop(self.size),
+            transforms_v2.ToImage(),
+            transforms_v2.ToDtype(torch.float32, scale=True),
+            transforms_v2.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+        ])
+    
+    def __len__(self):
+        return len(self.video_path_list)
+
+    def __getitem__(self, index):
+        video_path, audio_path = self.video_path_list[index], self.audio_path_list[index]
+
+        ## Load Video    
+        reader = StreamingMediaDecoder(video_path)
+        reader.add_basic_video_stream(
+            frames_per_chunk=self.expected_video_length,
+            frame_rate=self.video_fps,
+            format='rgb24',
+        )
+        reader.fill_buffer()
+        data_chunk = reader.pop_chunks()
+        video = data_chunk[0]
+
+        video = video[:self.expected_video_length]
+        video = smart_pad(video, self.expected_video_length-video.shape[0], dim=0)
+        # if video.shape[0] < self.expected_video_length:
+        #     raise RuntimeError(
+        #         f'Sync video too short {video_path}, '
+        #         f'expected {self.expected_video_length}, '
+        #         f'got {video.shape[0]}'
+        #     )
+        
+        video = self.video_transform(video)
+
+        ## Load Audio
+        waveform, sample_rate = torchaudio.load(audio_path)
+        waveform = waveform.mean(dim=0)  # mono
+
+        if sample_rate != self.audio_sr:
+            waveform = torchaudio.functional.resample(
+                waveform, orig_freq=sample_rate, new_freq=self.audio_sr
+            )
+
+        audio = waveform[:self.expected_audio_length]
+        audio = smart_pad(audio, self.expected_audio_length-audio.shape[0], dim=0)
+        # if audio.shape[0] < self.expected_audio_length:
+        #     raise RuntimeError(
+        #         f'Sync audio too short {audio_path}, '
+        #         f'expected {self.expected_audio_length}, '
+        #         f'got {audio.shape[0]}'
+        #     )
+
+        return video, audio
 
 
 def create_dataloader_for_fvd_mmdiff(video_list, temp_dir, fps, sr, clip_duration=1.6):
@@ -373,19 +544,56 @@ def create_dataloader_for_fvd_vanilla(
 
 
 def create_dataloader(metric, batch_size=8, num_workers=8, **kwargs):
+    if metric == 'video-quality':
+        collate_fn = DataCollatorForVideoAlignDataset(
+            processor=kwargs.pop('processor')
+        )
+    else:
+        collate_fn = None
+
     if metric == 'clip-score':
         dataset = VideoFrameDataset(**kwargs)
-    elif metric == 'clap-score':
+    elif metric == 'clap-score' or metric == 'audio-quality':
         dataset = AudioDataset(**kwargs)
+    elif metric == 'video-quality':
+        dataset = VideoAlignDataset(**kwargs)
     elif metric == 'cavp-score':
         dataset = CavpDataset(**kwargs)
+    elif metric == 'imagebind-score':
+        dataset = ImageBindDataset(**kwargs)
     elif metric == 'av-align':
         dataset = AVAlignDataset(**kwargs)
     elif metric == 'av-score':
         dataset = AVScoreDataset(**kwargs)
+    elif metric == 'desync-score':
+        dataset = DeSyncDataset(**kwargs)
 
     dataloader = DataLoader(dataset, batch_size=batch_size, 
                             shuffle=False, drop_last=False,
-                            num_workers=num_workers)
+                            num_workers=num_workers,
+                            collate_fn=collate_fn)
 
     return dataloader
+
+
+@dataclass
+class DataCollatorForVideoAlignDataset(object):
+    processor: AutoProcessor
+
+    def __call__(self, batch: Sequence[List]) -> Dict[str, torch.Tensor]:
+
+        chat_data, video_inputs = zip(*batch)
+        # [[a], [b]] -> [a, b]
+        chat_data = [x for sublist in chat_data for x in sublist]
+        video_inputs = [x for sublist in video_inputs for x in sublist]
+
+        batch = self.processor(
+            text=self.processor.apply_chat_template(chat_data, tokenize=False, add_generation_prompt=True),
+            images=None,
+            videos=video_inputs,
+            padding=True,
+            return_tensors="pt",
+            videos_kwargs={"do_rescale": True},
+        )
+
+        return batch

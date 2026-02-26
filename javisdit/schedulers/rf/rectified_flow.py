@@ -2,6 +2,7 @@ from typing import Dict
 import warnings
 
 import torch
+import torch.nn.functional as F
 from torch.distributions import LogisticNormal
 
 from ..iddpm.gaussian_diffusion import _extract_into_tensor, mean_flat
@@ -120,11 +121,25 @@ class RFlowScheduler:
         Note: t is int tensor and should be rescaled from [0, num_timesteps-1] to [1,0]
         Note: mask is a unified temporal mask for all modalities, dict{modality: t_mask}
         """
+        dpo_enabled = model_kwargs.pop('dpo_enabled', False)
+        if dpo_enabled:
+            ref_model = model_kwargs.pop('ref_model')
+            dpo_beta = model_kwargs.pop('dpo_beta')
+            if isinstance(dpo_beta, (int, float)):
+                dpo_beta = {k: dpo_beta for k in x_start.keys()}
+
         modal_keys = list(x_start.keys())  # e.g., ['video', 'audio']
         assert len(set([x.shape[0] for x in x_start.values()])) == 1, 'Unmatched batch size'
         B = x_start[modal_keys[0]].shape[0]
+        if dpo_enabled:
+            assert B % 2 == 0
+            B //= 2
         if t is None:
-            t = self.sample_timestep(x_start[modal_keys[0]], model_kwargs)
+            t = self.sample_timestep(x_start[modal_keys[0]][:B], model_kwargs)
+        if dpo_enabled:
+            t = torch.cat([t, t], dim=0)
+            B *= 2  # compatible with masking strategy
+
         if isinstance(mask, torch.Tensor):
             warnings.warn('Warning: t_mask is a tensor, which is automatically warpped as video t_mask')
             mask = {k: mask if k == 'video' else None}
@@ -135,7 +150,11 @@ class RFlowScheduler:
 
         if noise is None:
             # TODO: joint sampling or not, maybe not
-            noise = {k: torch.randn_like(x) for k, x in x_start.items()}
+            if dpo_enabled:
+                noise = {k: torch.randn_like(x.chunk(2, 0)[0]) for k, x in x_start.items()}
+                noise = {k: torch.cat([z, z], dim=0) for k, z in noise.items()}
+            else:
+                noise = {k: torch.randn_like(x) for k, x in x_start.items()}
         
         x_t: Dict[str, torch.Tensor] = {}
         for k in modal_keys:
@@ -150,23 +169,61 @@ class RFlowScheduler:
 
         terms = {}
         model_output: Dict[str, torch.Tensor] = model(x_t, t, **model_kwargs)
+        if dpo_enabled:
+            with torch.no_grad():
+                ref_model_output: Dict[str, torch.Tensor] = ref_model(x_t, t, **model_kwargs)
         if audio_only:
             for k in list(model_output.keys()):
                 if k != 'audio':
                     del model_output[k]
+            if dpo_enabled:
+                for k in list(ref_model_output.keys()):
+                    if k != 'audio':
+                        del ref_model_output[k]
+        
         loss_total = 0.0
         for k, velocity_pred in model_output.items():
             velocity_label = x_start[k] - noise[k]
             if velocity_pred.shape[1] != velocity_label.shape[1]:  # TODO: don't know why
                 assert velocity_pred.shape[1] == velocity_label.shape[1] * 2
                 velocity_pred = velocity_pred.chunk(2, dim=1)[0]
+
             t_mask = mask[k]
             if weights is None:
                 loss = mean_flat((velocity_pred - velocity_label).pow(2), mask=t_mask)
             else:
                 weight = _extract_into_tensor(weights, t, x_start[k].shape)
                 loss = mean_flat(weight * (velocity_pred - velocity_label).pow(2), mask=t_mask)
-            terms[f"loss_{k}"] = loss.detach().mean().item()
+
+            if dpo_enabled:
+                ref_velocity_pred = ref_model_output[k]
+                if ref_velocity_pred.shape[1] != velocity_label.shape[1]:  # TODO: don't know why
+                    assert ref_velocity_pred.shape[1] == velocity_label.shape[1] * 2
+                    ref_velocity_pred = ref_velocity_pred.chunk(2, dim=1)[0]
+
+                if weights is None:
+                    ref_loss = mean_flat((ref_velocity_pred - velocity_label).pow(2), mask=t_mask)
+                else:
+                    weight = _extract_into_tensor(weights, t, x_start[k].shape)
+                    ref_loss = mean_flat(weight * (ref_velocity_pred - velocity_label).pow(2), mask=t_mask)
+                
+                loss_win, loss_lose = loss.chunk(2)
+                ref_loss_win, ref_loss_lose = ref_loss.chunk(2)
+
+                diff_policy = loss_win - loss_lose
+                diff_ref = ref_loss_win - ref_loss_lose
+                scale_term = -0.5 * dpo_beta[k]
+                dpo_loss = -F.logsigmoid(scale_term * (diff_policy - diff_ref))
+
+                # update loss and add sft regularization
+                loss = dpo_loss + 0.1 * loss_win
+                
+                terms[f"policy_loss_{k}"] = loss_win.detach().mean()
+                terms[f"dpo_loss_{k}"] = dpo_loss.detach().mean()
+                terms[f"implicit_acc_{k}"] = (diff_policy < diff_ref).detach().float().mean()
+            
+            terms[f"loss_{k}"] = loss.detach().mean()
+
             loss_total += loss
         terms["loss"] = loss_total
 

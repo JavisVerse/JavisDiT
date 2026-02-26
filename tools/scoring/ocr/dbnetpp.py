@@ -43,6 +43,7 @@ model = dict(
         checkpoint="https://download.openmmlab.com/mmocr/textdet/dbnetpp/"
         "dbnetpp_resnet50-oclip_fpnc_1200e_icdar2015/"
         "dbnetpp_resnet50-oclip_fpnc_1200e_icdar2015_20221101_124139-4ecb39ac.pth",
+        # checkpoint="pretrained_models/dbnetpp_resnet50-oclip_fpnc_1200e_icdar2015_20221101_124139-4ecb39ac.pth"
     ),
 )
 

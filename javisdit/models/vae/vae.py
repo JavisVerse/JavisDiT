@@ -292,4 +292,5 @@ def OpenSoraVAE_V1_2(
 
         if from_pretrained:
             load_checkpoint(model, from_pretrained)
+    setattr(model, 'from_pretrained_path', 'from_pretrained')
     return model

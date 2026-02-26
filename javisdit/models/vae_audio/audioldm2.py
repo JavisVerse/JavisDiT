@@ -15,6 +15,7 @@ from diffusers import AudioLDM2Pipeline
 
 from javisdit.registry import MODELS
 from javisdit.utils.misc import requires_grad
+from javisdit.utils.ckpt_utils import load_ckpt_state_dict
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
@@ -26,16 +27,28 @@ class AudioLDM2:
         from_pretrained: Optional[str] = None,
         device='cuda',
         dtype=torch.float,
+        init_to_device=True,
     ) -> None:
         super().__init__()
         self.dtype = dtype
         self.device = device
 
-        self.pipe: AudioLDM2Pipeline = AudioLDM2Pipeline.from_pretrained(from_pretrained).to(device, dtype)
+        self.pipe: AudioLDM2Pipeline = AudioLDM2Pipeline.from_pretrained(from_pretrained).to(dtype)
+        if init_to_device:
+            self.pipe.to(device)
         for m in [self.pipe.vae, self.pipe.vocoder]:
             m.eval()
             requires_grad(m, False)
         self.free_text()
+        self.from_pretrained_path = from_pretrained
+
+    def load_pretrained_ckpt(self):
+        self.pipe.vae.load_state_dict(load_ckpt_state_dict(
+            osp.join(self.from_pretrained_path, 'vae', 'diffusion_pytorch_model.safetensors')
+        ))
+        self.pipe.vocoder.load_state_dict(load_ckpt_state_dict(
+            osp.join(self.from_pretrained_path, 'vocoder', 'model.safetensors')
+        ))
 
     def free_text(self):
         del self.pipe.text_encoder; self.pipe.text_encoder = nn.Identity()
@@ -106,3 +119,7 @@ class AudioLDM2:
         latents = torch.randn(*shape, device=device, dtype=dtype)
 
         return latents, original_waveform_length
+    
+    @property
+    def vae_out_channels(self):
+        return self.pipe.vae.config.latent_channels

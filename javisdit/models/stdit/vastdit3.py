@@ -393,6 +393,8 @@ class VASTDiT3(STDiT3):
 
         # initialize
         self.initialize_va_weights()
+        self.weight_init_from = self.config.weight_init_from
+        self.load_pretrained_ckpt()
         # TODO: reuse null y_embedding
         self.audio_y_embedder.y_embedding.data = self.y_embedder.y_embedding.data
 
@@ -435,6 +437,22 @@ class VASTDiT3(STDiT3):
         if not config.train_va_cross_attn:
             del self.va_cross_blocks; self.va_cross_blocks = mm_identities
 
+    def load_pretrained_ckpt(self):
+        init_paths = self.config.weight_init_from
+        if not init_paths:
+            return
+        if isinstance(init_paths, str) and os.path.exists(init_paths):
+            init_paths = [init_paths]
+        for pretrain_path in init_paths:
+            load_checkpoint(self, pretrain_path, verbose=False)
+        # copy parameters from video to audio
+        if self.config.only_train_audio:
+            for v_blocks, a_blocks in zip([self.spatial_blocks, self.temporal_blocks, [self.y_embedder]], 
+                                            [self.audio_spatial_blocks, self.audio_temporal_blocks, [self.audio_y_embedder]]):
+                for v_block, a_block in zip(v_blocks, a_blocks):
+                    a_block.load_state_dict(deepcopy(v_block.state_dict()))
+            logger.info('audio `spatial_blocks`, `temporal_blocks`, `y_embedder` are initialized from video branch.')
+
     def initialize_va_weights(self):
         # Initialize newly-introduced blocks
         for block in self.audio_temporal_blocks:
@@ -450,20 +468,6 @@ class VASTDiT3(STDiT3):
             nn.init.constant_(block.spatial_cross_attn.proj.weight, 0)
             nn.init.constant_(block.temporal_cross_attn.proj.weight, 0)
             nn.init.constant_(block.mlp.fc2.weight, 0)
-        
-        if self.config.weight_init_from is not None:
-            init_paths = self.config.weight_init_from
-            if isinstance(init_paths, str):
-                init_paths = [init_paths]
-            for pretrain_path in init_paths:
-                load_checkpoint(self, pretrain_path, verbose=False)
-            # copy parameters from video to audio
-            if self.config.only_train_audio:
-                for v_blocks, a_blocks in zip([self.spatial_blocks, self.temporal_blocks, [self.y_embedder]], 
-                                              [self.audio_spatial_blocks, self.audio_temporal_blocks, [self.audio_y_embedder]]):
-                    for v_block, a_block in zip(v_blocks, a_blocks):
-                        a_block.load_state_dict(deepcopy(v_block.state_dict()))
-                logger.info('audio `spatial_blocks`, `temporal_blocks`, `y_embedder` are initialized from video branch.')
 
     def get_audio_size(self, x):
         B, _, Ts, M = x.size()
