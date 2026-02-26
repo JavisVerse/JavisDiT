@@ -17,11 +17,12 @@ Under the [JavisVerse](https://javisverse.github.io/) project, this repo present
 
 The main branch maintains **JavisDiT++**, a more concise yet powerful DiT model to generate semantically and temporally aligned sounding videos with textual conditions. Auxiliary support of JavisDiT (v0.1) can be found at [assets/docs/JavisDiT.md](assets/docs/JavisDiT.md).
 
-<!-- https://github.com/user-attachments/assets/de5f0bcc-fb5d-4410-a795-2dd3ae3ac788 -->
+https://github.com/user-attachments/assets/c7a0d9dc-71d3-4fb6-8c97-00553062de51
+<!-- [![cover](https://img.youtube.com/vi/PUSGQU6ZpdE/maxresdefault.jpg)](https://www.youtube.com/watch?v=PUSGQU6ZpdE) -->
 
-<video controls width="100%">
+<!-- <video controls width="100%">
   <source src="https://raw.githubusercontent.com/JavisVerse/JavisDiT/main/assets/video/teaser-video-JavisDiT++.mp4" type="video/mp4">
-</video>
+</video> -->
 
 ## 📰 News
 
