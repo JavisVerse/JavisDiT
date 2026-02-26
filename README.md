@@ -3,31 +3,35 @@
 <div align="center">
 
 [[`HomePage`](https://JavisVerse.github.io/JavisDiT2-page/)] 
-[[`ArXiv Paper`](https://arxiv.org/pdf/2602.19163)] 
+[[`ArXiv Paper`](https://arxiv.org/abs/2602.19163)] 
 [[`HF Paper`](https://huggingface.co/papers/2602.19163)]
 [[`Model`](https://huggingface.co/collections/JavisVerse/javisdit-v1.0)]
 
 </div>
 
 
-Under the [JavisVerse](https://javisverse.github.io/) project, we introduce **JavisDiT++**, a concise yet powerful DiT model to generate semantically and temporally aligned sounding videos with textual conditions.
+Under the [JavisVerse](https://javisverse.github.io/) project, this repo presents two versions of the JavisDiT series:
+
+- [JavisDiT](https://arxiv.org/abs/2503.23377): Joint Audio-Video Diffusion Transformer with Hierarchical Spatio-Temporal Prior Synchronization (a.k.a. **JavisDiT-v0.1**)
+- [JavisDiT++](https://arxiv.org/abs/2602.19163): Unified Modeling and Optimization for Joint Audio-Video Generation (a.k.a. **JavisDiT-v1.0**)
+
+The main branch maintains **JavisDiT++**, a more concise yet powerful DiT model to generate semantically and temporally aligned sounding videos with textual conditions. Auxiliary support of JavisDiT (v0.1) can be found at [assets/docs/JavisDiT.md](assets/docs/JavisDiT.md).
 
 <!-- https://github.com/user-attachments/assets/de5f0bcc-fb5d-4410-a795-2dd3ae3ac788 -->
 
 <video controls width="100%">
-  <source src="assets/video/teaser-video-JavisDiT++.mp4" type="video/mp4">
-  Your browser does not support the video tag.
+  <source src="https://raw.githubusercontent.com/JavisVerse/JavisDiT/main/assets/video/teaser-video-JavisDiT++.mp4" type="video/mp4">
 </video>
 
 ## 📰 News
 
-- **[2026.02.26]** 🔥🔥 This repository has upgraded from [JavisDiT](https://arxiv.org/pdf/2503.23377) to [JavisDiT++](https://arxiv.org/pdf/2602.19163), both of which are accepted at **ICLR 2026**. Fore previous version, please refer to [assets/docs/JavisDiT.md](assets/docs/JavisDiT.md).
+- **[2026.02.26]** 🔥🔥 This repository has upgraded from [JavisDiT](https://arxiv.org/abs/2503.23377) to [JavisDiT++](https://arxiv.org/abs/2602.19163), both of which are accepted at **ICLR 2026**. Fore the previous version, please refer to [assets/docs/JavisDiT.md](assets/docs/JavisDiT.md).
 - **[2025.12.26]** 🚀 JavisDiT and JavisGPT are integrated into the [JavisVerse](https://javisverse.github.io/) project. We hope to contribute to the _Joint Audio-Video Intelligence Symphony (Javis)_ in the community.
 - **[2025.12.26]** 🚀 We released [JavisGPT](https://openreview.net/forum?id=MZoOpD9NHV), a unified multi-modal LLM for sounding-video comprehension and generation. For more details refer to this [repo](https://github.com/JavisVerse/JavisGPT). 
 - **[2025.08.11]** 🔥 We released the data and code for JAVG evaluation. For more details refer to [eval/javisbench/README.md](eval/javisbench/README.md).
 - **[2025.04.15]** 🔥 We released the data preparation and model training instructions. You can train JavisDiT with your own dataset!
 - **[2025.04.07]** 🔥 We released the inference code and a preview model of **JavisDiT-v0.1** at [HuggingFace](https://huggingface.co/JavisDiT). <!-- , which includes **JavisDiT-v0.1-audio**, **JavisDiT-v0.1-prior**, and **JavisDiT-v0.1-jav** (with a [low-resolution version](https://huggingface.co/JavisVerse/JavisDiT-v0.1-jav-240p4s) and a [full-resolution version](https://huggingface.co/JavisVerse/JavisDiT-v0.1-jav)). -->
-- **[2025.04.03]** We release the repository of [JavisDiT](https://arxiv.org/pdf/2503.23377). Code, model, and data are coming soon.
+- **[2025.04.03]** We release the repository of [JavisDiT](https://arxiv.org/abs/2503.23377). Code, model, and data are coming soon.
 
 ### 👉 TODO 
 - [ ] Release the data and evaluation code for JavisScore.
@@ -46,7 +50,7 @@ Under the [JavisVerse](https://javisverse.github.io/) project, we introduce **Ja
 - We propose a temporally aligned rotary position encoding (**TA-RoPE**) scheme to ensure explicit and fine-grained audio-video token synchronization.
 - We devise the **AV-DPO** technique to consistently improve audio-video quality and synchronization by aligning generation with human preferences.
 
-We hope to set a new standard for the JAVG community. For more technical details, kindly refer to the original [paper](https://arxiv.org/pdf/2602.19163). 
+We hope to set a new standard for the JAVG community. For more technical details, kindly refer to the original [paper](https://arxiv.org/abs/2602.19163). 
 
 
 ## Installation
@@ -101,8 +105,6 @@ hf download JavisVerse/JavisDiT-v1.0-jav --local-dir ./checkpoints/JavisDiT-v1.0
 hf download Wan-AI/Wan2.1-T2V-1.3B --local-dir ./checkpoints/Wan2.1-T2V-1.3B
 hf download cvssp/audioldm2 --local-dir ./checkpoints/audioldm2
 ```
-
-> For users from mainland China, try `export HF_ENDPOINT=https://hf-mirror.com` to successfully download the weights.
 
 
 ## Inference
@@ -198,7 +200,7 @@ The resulting checkpoints will be saved at `runs/0xx-Wan2_1_T2V_1_3B/epoch0yy-gl
 ### Stage3 - Audio-Video DPO
 
 This stage deploy DPO to improve human-preference alignment of T2AV generation.
-Following the [instructions](assets/docs/data.md#stage3---audio-video-dpo) to prepare the audio-video preference data. We are trying to release our generated data. 
+Following the [instructions](assets/docs/data.md#stage3---audio-video-dpo) to prepare the audio-video preference data. We are working on releasing our generated data. 
 
 Then, run the command:
 
