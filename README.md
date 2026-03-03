@@ -27,7 +27,7 @@ https://github.com/user-attachments/assets/30a0d54d-df8c-4b69-b23b-d542f8bd0522
 ## 📰 News
 
 - **[2026.02.26]** 🔥🔥 **JavisDiT++** are also integrated into [JavisGPT](https://github.com/JavisVerse/JavisGPT)!
-- **[2026.02.26]** 🔥🔥 This repository has upgraded from [JavisDiT](https://arxiv.org/abs/2503.23377) to [JavisDiT++](https://arxiv.org/abs/2602.19163), both of which are accepted at **ICLR 2026**. Fore the previous version, please refer to [assets/docs/JavisDiT.md](assets/docs/JavisDiT.md).
+- **[2026.02.26]** 🔥🔥 This repository has upgraded from [JavisDiT](https://arxiv.org/abs/2503.23377) to [JavisDiT++](https://arxiv.org/abs/2602.19163), both of which are accepted by **ICLR 2026**. For the initial version, please refer to [assets/docs/JavisDiT.md](assets/docs/JavisDiT.md).
 - **[2025.12.26]** 🚀 JavisDiT and JavisGPT are integrated into the [JavisVerse](https://javisverse.github.io/) project. We hope to contribute to the _Joint Audio-Video Intelligence Symphony (Javis)_ in the community.
 - **[2025.12.26]** 🚀 We released [JavisGPT](https://arxiv.org/abs/2512.22905), a unified multi-modal LLM for sounding-video comprehension and generation. For more details refer to this [repo](https://github.com/JavisVerse/JavisGPT). 
 - **[2025.08.11]** 🔥 We released the data and code for JAVG evaluation. For more details refer to [eval/javisbench/README.md](eval/javisbench/README.md).
