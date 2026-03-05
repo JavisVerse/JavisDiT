@@ -348,10 +348,10 @@ If you find JavisDiT is useful and use it in your project, please kindly cite:
 
 ```bibtex
 @inproceedings{liu2025javisdit,
-      title={JavisDiT: Joint Audio-Video Diffusion Transformer with Hierarchical Spatio-Temporal Prior Synchronization}, 
-      author={Kai Liu and Wei Li and Lai Chen and Shengqiong Wu and Yanhao Zheng and Jiayi Ji and Fan Zhou and Rongxin Jiang and Jiebo Luo and Hao Fei and Tat-Seng Chua},
-      booktitle={arxiv},
-      year={2025}, 
+  title     = {JavisDiT: Joint Audio-Video Diffusion Transformer with Hierarchical Spatio-Temporal Prior Synchronization}, 
+  author    = {Kai Liu and Wei Li and Lai Chen and Shengqiong Wu and Yanhao Zheng and Jiayi Ji and Fan Zhou and Rongxin Jiang and Jiebo Luo and Hao Fei and Tat-Seng Chua},
+  booktitle = {The Fourteenth International Conference on Learning Representations},
+  year      = {2026},
 }
 ```
 

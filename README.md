@@ -320,10 +320,10 @@ If you find JavisDiT is useful and use it in your project, please kindly cite:
 }
 
 @inproceedings{liu2026javisdit++,
-  title       = {JavisDiT++: Unified Modeling and Optimization for Joint Audio-Video Generation},
-  author      = {Liu, Kai and Zheng, Yanhao and Wang, Kai and Wu, Shengqiong and Zhang, Rongjunchen and Luo, Jiebo and Hatzinakos, Dimitrios and Liu, Ziwei and Fei, Hao and Chua, Tat-Seng},
-  conference  = {The Fourteenth International Conference on Learning Representations},
-  year        = {2026},
+  title     = {JavisDiT++: Unified Modeling and Optimization for Joint Audio-Video Generation},
+  author    = {Liu, Kai and Zheng, Yanhao and Wang, Kai and Wu, Shengqiong and Zhang, Rongjunchen and Luo, Jiebo and Hatzinakos, Dimitrios and Liu, Ziwei and Fei, Hao and Chua, Tat-Seng},
+  booktitle = {The Fourteenth International Conference on Learning Representations},
+  year      = {2026},
 }
 ```
 
