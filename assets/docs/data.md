@@ -4,7 +4,7 @@
 
 ### Stage1 - Audio Pretrain
 
-In this stage, we only need audio files to initialize the audio generation capability:
+In this stage, we only need audio files to initialize the audio generation capability. Our pre-processed data is released at [HuggingFace](https://huggingface.co/datasets/JavisVerse/JavisData-Audio), and the data-curation pipeline is described as follows:
 
 | path | id | relpath | num_frames | height | width | aspect_ratio | fps | resolution | audio_path | audio_fps | text| audio_text|
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -40,7 +40,7 @@ python -m tools.datasets.find_audio_ds all \
 
 ### Stage2 - Audio-Video SFT
 
-Here we provide an example with [TAVGBench](https://github.com/OpenNLPLab/TAVGBench) to prepare video-audio-text triplets for training. You can easily transfer to your own datasets.
+Here we provide an example with [TAVGBench](https://github.com/OpenNLPLab/TAVGBench) to prepare video-audio-text triplets for training. The `video_id` list used in JavisDiT++ is provided at [assets/meta/AV_SFT_330K_video_ids.txt](assets/meta/AV_SFT_330K_video_ids.txt), and you can easily transfer to your own datasets.
 
 | path | id | relpath | num_frames | height | width | aspect_ratio | fps | resolution | audio_path | audio_fps | text|
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | ---|

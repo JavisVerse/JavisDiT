@@ -185,7 +185,7 @@ The resulting checkpoints will be saved at `runs/0aa-Wan2_1_T2V_1_3B/epoch0bb-gl
 ### Stage2 - Audio-Video SFT
 
 This stage finetunes the T2V+T2A backbone for preliminary T2AV generation. 
-Following the [instructions](assets/docs/data.md#stage2---audio-video-sft) to prepare the audio-video data. Due to copyright issues, we cannot release the raw YouTube videos used by [TAVGBench](https://github.com/OpenNLPLab/TAVGBench).
+Following the [instructions](assets/docs/data.md#stage2---audio-video-sft) to prepare the audio-video data, and the `video_id` list used in JavisDiT++ is provided at [assets/meta/AV_SFT_330K_video_ids.txt](assets/meta/AV_SFT_330K_video_ids.txt), as we cannot release the raw YouTube videos used by [TAVGBench](https://github.com/OpenNLPLab/TAVGBench) due to copyright issues.
 
 Then, run the command:
 
