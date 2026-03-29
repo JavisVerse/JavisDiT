@@ -302,6 +302,9 @@ python -m eval.javisbench.main \
   --metrics ${METRICS}
 ```
 
+By default we evaluate all the 16 metrics with the `METRICS="all"` flag, and you can switch the evaluation mode as `fvd+kvd+fad`, `video-quality`, `audio-quality`, `imagebind-score`, `cxxp-score`, `av-align`, `av-score`, `desync` for partial evaluation for your need.
+For more details please refer to [eval/javisbench/README.md](./eval/javisbench/README.md#4-details-of-evaluation-metrics) and [eval/javisbench/main.py](./eval/javisbench/main.py#L81)..
+
 ## Acknowledgement
 
 Below we show our appreciation for the exceptional work and generous contribution to open source. Special thanks go to the authors of [Open-Sora](https://github.com/hpcaitech/Open-Sora), [Wan-Video](https://github.com/Wan-Video/Wan2.1), [AudioLDM2](https://github.com/haoheliu/AudioLDM2), and [TAVGBench](https://github.com/OpenNLPLab/TAVGBench) for their valuable codebase and dataset. For other works and datasets, please refer to our paper.

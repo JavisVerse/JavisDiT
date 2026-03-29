@@ -121,6 +121,8 @@ torchrun --nproc_per_node=1 -m eval.javisbench.main \
 ```
 
 The results will be displayed in terminal and saved in `./evaluation_results`.
+By default we evaluate all the 16 metrics with the `METRICS="all"` flag, and you can switch the evaluation mode as `fvd+kvd+fad`, `video-quality`, `audio-quality`, `imagebind-score`, `cxxp-score`, `av-align`, `av-score`, `desync` for partial evaluation for your need.
+For more details please refer to the [code implementation](./main.py#L81).
 
 
 ### 4. Details of Evaluation Metrics
@@ -132,7 +134,7 @@ We evaluate JAVG models from **4** complementary perspectives:
 
 Measures on the perceptual quality of the generated audio and video.
 
-* **Fréchet Video Distance (FVD)**
+* **Fréchet Video Distance (FVD)**:
   Formula:
 
   $\mathrm{FVD} = \|\mu_r - \mu_g\|_2^2 + \mathrm{Tr}(\Sigma_r + \Sigma_g - 2(\Sigma_r\Sigma_g)^{1/2})$
@@ -140,19 +142,26 @@ Measures on the perceptual quality of the generated audio and video.
   where $(\mu_r, \Sigma_r)$ and $(\mu_g, \Sigma_g)$ are the mean and covariance of **real** and **generated** video features extracted by a pretrained video feature encoder (e.g., [I3D](https://arxiv.org/pdf/1705.07750)).
   **Lower is better**, indicating the generated video distribution is closer to the real one.
 
-* **Kernel Video Distance (KVD)**
+* **Kernel Video Distance (KVD)**:
   Similar to FVD, but estimates distribution differences via a kernel-based method (Kernel Inception Distance style), which is more stable on smaller datasets; **lower is better**.
 
-* **Fréchet Audio Distance (FAD)**
+* **Fréchet Audio Distance (FAD)**:
   Same concept as FVD, but computed on **audio** features extracted by a pretrained audio model (e.g., [AudioClip](https://arxiv.org/pdf/2106.13043)).
   Measures distribution distance between generated and real audio; **lower is better**.
+
+* **Video Quality**:
+  We adopt [VideoAlign](https://github.com/KlingAIResearch/VideoAlign) to measure (1) `visual_quality` (clarity, aesthetics, and single-frame reasonableness) and (2) `motion_quality` (dynamic stability, dynamic reasonableness, naturalness) of the generated video.
+
+
+* **Audio Quality**:
+  We adopt [AudioBox](https://github.com/facebookresearch/audiobox-aesthetics) to assess the generated audio by averaging the scores from four dimensions: CE (Content Enjoyment), CU (Content Usefulness), PC (Production Complexity), and PQ (Production Quality).
 
 
 #### 4.2 Semantic Consistency Against Conditional Texts
 
 Evaluates how well the generated audio and video semantically match the input text description.
 
-* **[ImageBind](https://github.com/facebookresearch/ImageBind) Similarity**
+* **[ImageBind](https://github.com/facebookresearch/ImageBind) Similarity**:
 
   * **Text–Video**: Encode text $t$ and video $v$ into a shared embedding space and compute cosine similarity:
 
@@ -171,7 +180,7 @@ Evaluates how well the generated audio and video semantically match the input te
 
 Measures the semantic alignment between generated audio and generated video.
 
-* **ImageBind (Video–Audio)**:
+* **[ImageBind](https://github.com/facebookresearch/ImageBind) (Video–Audio Similarity)**:
   Encodes both modalities into the same space and computes cosine similarity between video and audio features.
 
 * **[CAVP](https://github.com/luosiallen/Diff-Foley) (Cross-Audio-Video Pretraining)**:
