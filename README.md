@@ -273,13 +273,7 @@ rm -f ${save_dir}/meta*.csv
 Run the following code and the results will be saved in `./evaluation_results`.
 
 ```bash
-MAX_FRAMES=16
-IMAGE_SIZE=224
 MAX_AUDIO_LEN_S=4.0
-
-# Params to calculate JavisScore
-WINDOW_SIZE_S=2.0
-WINDOW_OVERLAP_S=1.5
 
 METRICS="all" 
 RESULTS_DIR="./evaluation_results"
@@ -293,11 +287,7 @@ python -m eval.javisbench.main \
   --input_file "${INPUT_FILE}" \
   --infer_data_dir "${INFER_DATA_DIR}" \
   --output_file "${RESULTS_DIR}/${DATASET}.json" \
-  --max_frames ${MAX_FRAMES} \
-  --image_size ${IMAGE_SIZE} \
   --max_audio_len_s ${MAX_AUDIO_LEN_S} \
-  --window_size_s ${WINDOW_SIZE_S} \
-  --window_overlap_s ${WINDOW_OVERLAP_S} \
   --fvd_avcache_path ${FVD_AVCACHE_PATH} \
   --metrics ${METRICS}
 ```
