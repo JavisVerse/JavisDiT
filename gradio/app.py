@@ -175,10 +175,13 @@ from javisdit.utils.inference_utils import (
     extract_json_from_prompts,
     extract_prompts_loop,
     get_random_prompt_by_openai,
+    get_random_prompt_by_llm,
     has_openai_key,
+    has_minimax_key,
     merge_prompt,
     prepare_multi_resolution_info,
     refine_prompts_by_openai,
+    refine_prompts_by_llm,
     split_prompt,
 )
 from javisdit.utils.misc import to_torch_dtype
@@ -289,14 +292,14 @@ def run_inference(
             batched_prompt_segment_list.append(prompt_segment_list)
             batched_loop_idx_list.append(loop_idx_list)
 
-        # 1. refine prompt by openai
+        # 1. refine prompt by available LLM provider (MiniMax or OpenAI)
         if refine_prompt:
-            # check if openai key is provided
-            if not has_openai_key():
-                gr.Warning("OpenAI API key is not provided, the prompt will not be enhanced.")
+            # check if any LLM key is provided
+            if not has_minimax_key() and not has_openai_key():
+                gr.Warning("No LLM API key provided (MINIMAX_API_KEY or OPENAI_API_KEY). The prompt will not be enhanced.")
             else:
                 for idx, prompt_segment_list in enumerate(batched_prompt_segment_list):
-                    batched_prompt_segment_list[idx] = refine_prompts_by_openai(prompt_segment_list)
+                    batched_prompt_segment_list[idx] = refine_prompts_by_llm(prompt_segment_list)
 
         # process scores
         aesthetic_score = aesthetic_score if use_aesthetic_score else None
@@ -449,11 +452,11 @@ def run_video_inference(
 
 
 def generate_random_prompt():
-    if "OPENAI_API_KEY" not in os.environ:
-        gr.Warning("Your prompt is empty and the OpenAI API key is not provided, please enter a valid prompt")
+    if not has_minimax_key() and "OPENAI_API_KEY" not in os.environ:
+        gr.Warning("Your prompt is empty and no LLM API key is provided (MINIMAX_API_KEY or OPENAI_API_KEY), please enter a valid prompt")
         return None
     else:
-        prompt_text = get_random_prompt_by_openai()
+        prompt_text = get_random_prompt_by_llm()
         return prompt_text
 
 

@@ -329,6 +329,7 @@ def dframe_to_frame(num):
 
 
 OPENAI_CLIENT = None
+MINIMAX_CLIENT = None
 REFINE_PROMPTS = None
 REFINE_PROMPTS_PATH = "assets/texts/t2v_pllava.txt"
 REFINE_PROMPTS_TEMPLATE = """
@@ -344,6 +345,9 @@ You need to generate one input prompt for video generation task. The prompt shou
 
 The prompt should pay attention to all objects in the video. The description should be useful for AI to re-generate the video. The description should be no more than six sentences. The prompt should be in English.
 """
+
+MINIMAX_API_BASE = "https://api.minimax.io/v1"
+MINIMAX_DEFAULT_MODEL = "MiniMax-M2.7"
 
 
 def get_openai_response(sys_prompt, usr_prompt, model="gpt-4o"):
@@ -370,6 +374,45 @@ def get_openai_response(sys_prompt, usr_prompt, model="gpt-4o"):
     return completion.choices[0].message.content
 
 
+def get_minimax_response(sys_prompt, usr_prompt, model=MINIMAX_DEFAULT_MODEL):
+    """Call MiniMax LLM via OpenAI-compatible API for prompt refinement."""
+    global MINIMAX_CLIENT
+    if MINIMAX_CLIENT is None:
+        from openai import OpenAI
+
+        MINIMAX_CLIENT = OpenAI(
+            api_key=os.environ.get("MINIMAX_API_KEY"),
+            base_url=MINIMAX_API_BASE,
+        )
+
+    # MiniMax requires temperature in (0.0, 1.0]
+    completion = MINIMAX_CLIENT.chat.completions.create(
+        model=model,
+        temperature=0.7,
+        messages=[
+            {"role": "system", "content": sys_prompt},
+            {"role": "user", "content": usr_prompt},
+        ],
+    )
+
+    return completion.choices[0].message.content
+
+
+def has_openai_key():
+    return "OPENAI_API_KEY" in os.environ
+
+
+def has_minimax_key():
+    return "MINIMAX_API_KEY" in os.environ
+
+
+def get_llm_response(sys_prompt, usr_prompt):
+    """Auto-detect available LLM provider: MiniMax takes priority over OpenAI."""
+    if has_minimax_key():
+        return get_minimax_response(sys_prompt, usr_prompt)
+    return get_openai_response(sys_prompt, usr_prompt)
+
+
 def get_random_prompt_by_openai():
     global RANDOM_PROMPTS
     if RANDOM_PROMPTS is None:
@@ -390,8 +433,24 @@ def refine_prompt_by_openai(prompt):
     return response
 
 
-def has_openai_key():
-    return "OPENAI_API_KEY" in os.environ
+def get_random_prompt_by_llm():
+    """Generate a random video prompt using the available LLM provider."""
+    global RANDOM_PROMPTS
+    if RANDOM_PROMPTS is None:
+        examples = load_prompts(REFINE_PROMPTS_PATH)
+        RANDOM_PROMPTS = RANDOM_PROMPTS_TEMPLATE.format("\n".join(examples))
+
+    return get_llm_response(RANDOM_PROMPTS, "Generate one example.")
+
+
+def refine_prompt_by_llm(prompt):
+    """Refine a video generation prompt using the available LLM provider."""
+    global REFINE_PROMPTS
+    if REFINE_PROMPTS is None:
+        examples = load_prompts(REFINE_PROMPTS_PATH)
+        REFINE_PROMPTS = REFINE_PROMPTS_TEMPLATE.format("\n".join(examples))
+
+    return get_llm_response(REFINE_PROMPTS, prompt)
 
 
 def refine_prompts_by_openai(prompts):
@@ -407,6 +466,25 @@ def refine_prompts_by_openai(prompts):
             new_prompts.append(new_prompt)
         except Exception as e:
             print(f"[Warning] Failed to refine prompt: {prompt} due to {e}")
+            new_prompts.append(prompt)
+    return new_prompts
+
+
+def refine_prompts_by_llm(prompts):
+    """Refine prompts using the available LLM provider (MiniMax or OpenAI)."""
+    provider = "MiniMax" if has_minimax_key() else "OpenAI"
+    new_prompts = []
+    for prompt in prompts:
+        try:
+            if prompt.strip() == "":
+                new_prompt = get_random_prompt_by_llm()
+                print(f"[Info] Empty prompt detected, generate random prompt via {provider}: {new_prompt}")
+            else:
+                new_prompt = refine_prompt_by_llm(prompt)
+                print(f"[Info] Refine prompt via {provider}: {prompt} -> {new_prompt}")
+            new_prompts.append(new_prompt)
+        except Exception as e:
+            print(f"[Warning] Failed to refine prompt via {provider}: {prompt} due to {e}")
             new_prompts.append(prompt)
     return new_prompts
 
