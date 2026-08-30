@@ -79,6 +79,64 @@ python -m tools.datasets.datautil ds1.csv ds2.csv ... --output /path/to/output.c
 
 ### Stage3 - Audio-Video DPO
 
+#### Using the released AV-DPO data
+
+Download [AV-DPO](https://huggingface.co/datasets/JavisVerse/AV-DPO):
+
+```bash
+hf download --repo-type dataset JavisVerse/AV-DPO --local-dir data/AV-DPO
+for archive in data/AV-DPO/data_zips/*.zip; do unzip -q "$archive" -d data/AV-DPO; done
+```
+
+The release uses JavisDiT's native DPO columns, including `path`, `path_reject`,
+and `text`. Media paths are relative to the JavisDiT repository root, so run the
+commands below from that directory and keep the dataset at `data/AV-DPO`.
+
+Each released MP4 contains both H.264 video and an AAC audio track. The Stage 3
+configuration sets `use_audio_in_video=True`, so `audio_path` and
+`audio_path_reject` point to the same MP4 files and no separate audio files are
+needed. If standalone 16 kHz WAV files are needed for inspection or another
+tool, use JavisDiT's dataset utilities to extract all released generated audio
+tracks in batch:
+
+```bash
+python -m tools.datasets.convert video data/AV-DPO/data/generated \
+    --output data/AV-DPO/generated_videos.csv
+python -m tools.datasets.datautil data/AV-DPO/generated_videos.csv \
+    --extract-audio --audio-sr 16000
+```
+
+This writes each WAV next to its source MP4 and records the paths in
+`data/AV-DPO/generated_videos_au_sr16000.csv`. This step is optional and is not
+used by the Stage 3 command below.
+
+The generated-only split is self-contained and can be used directly:
+
+```bash
+torchrun --standalone --nproc_per_node 8 \
+    scripts/train.py \
+    configs/javisdit-v1-0/train/stage3_audio_video_dpo.py \
+    --data-path data/AV-DPO/train_generated_only.csv
+```
+
+The full `train.csv` contains the 23,671 preference pairs used for the paper
+setting. Since TAVGBench ground-truth YouTube media cannot be redistributed,
+obtain those videos by following the
+[TAVGBench instructions](https://github.com/OpenNLPLab/TAVGBench), then make
+them available at the metadata's expected local path:
+
+```bash
+mkdir -p data/AV-DPO/data
+ln -s /path/to/TAVGBench/videos data/AV-DPO/data/tavgbbench
+
+torchrun --standalone --nproc_per_node 8 \
+    scripts/train.py \
+    configs/javisdit-v1-0/train/stage3_audio_video_dpo.py \
+    --data-path data/AV-DPO/train.csv
+```
+
+#### Curating AV-DPO data from scratch
+
 To run DPO, you need to prepare a data pool isolated from the SFT training data, organized into a `train_av_dpo_raw.csv`:
 
 | path | id | relpath | num_frames | height | width | aspect_ratio | fps | resolution | audio_path | audio_fps | text|

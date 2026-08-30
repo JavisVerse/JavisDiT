@@ -6,6 +6,7 @@
 [[`ArXiv Paper`](https://arxiv.org/abs/2602.19163)] 
 [[`HF Paper`](https://huggingface.co/papers/2602.19163)]
 [[`Model`](https://huggingface.co/collections/JavisVerse/javisdit-v1.0)]
+[[`AV-DPO Dataset`](https://huggingface.co/datasets/JavisVerse/AV-DPO)]
 
 </div>
 
@@ -26,8 +27,9 @@ https://github.com/user-attachments/assets/30a0d54d-df8c-4b69-b23b-d542f8bd0522
 
 ## 📰 News
 
+- **[2026.08.30]** 🚀 We released the [AV-DPO preference dataset](https://huggingface.co/datasets/JavisVerse/AV-DPO).
 - **[2026.02.26]** 🔥🔥 **JavisDiT++** are also integrated into [JavisGPT](https://github.com/JavisVerse/JavisGPT)!
-- **[2026.02.26]** 🔥🔥 This repository has upgraded from [JavisDiT](https://arxiv.org/abs/2503.23377) to [JavisDiT++](https://arxiv.org/abs/2602.19163), both of which are accepted by **ICLR 2026**. For the initial version, please refer to [assets/docs/JavisDiT.md](assets/docs/JavisDiT.md).
+- **[2026.02.26]** 🎉🎉 This repository has upgraded from [JavisDiT](https://arxiv.org/abs/2503.23377) to [JavisDiT++](https://arxiv.org/abs/2602.19163), both of which are accepted by **ICLR 2026**. For the initial version, please refer to [assets/docs/JavisDiT.md](assets/docs/JavisDiT.md).
 - **[2025.12.26]** 🚀 JavisDiT and JavisGPT are integrated into the [JavisVerse](https://javisverse.github.io/) project. We hope to contribute to the _Joint Audio-Video Intelligence Symphony (Javis)_ in the community.
 - **[2025.12.26]** 🚀 We released [JavisGPT](https://arxiv.org/abs/2512.22905), a unified multi-modal LLM for sounding-video comprehension and generation. For more details refer to this [repo](https://github.com/JavisVerse/JavisGPT). 
 - **[2025.08.11]** 🔥 We released the data and code for JAVG evaluation. For more details refer to [eval/javisbench/README.md](eval/javisbench/README.md).
@@ -36,6 +38,7 @@ https://github.com/user-attachments/assets/30a0d54d-df8c-4b69-b23b-d542f8bd0522
 - **[2025.04.03]** We release the repository of [JavisDiT](https://arxiv.org/abs/2503.23377). Code, model, and data are coming soon.
 
 ### 👉 TODO 
+- [x] Release the AV-DPO preference data and training support.
 - [ ] Release the data and evaluation code for JavisScore.
 
 ## Brief Introduction
@@ -201,8 +204,14 @@ The resulting checkpoints will be saved at `runs/0xx-Wan2_1_T2V_1_3B/epoch0yy-gl
 
 ### Stage3 - Audio-Video DPO
 
-This stage deploy DPO to improve human-preference alignment of T2AV generation.
-Following the [instructions](assets/docs/data.md#stage3---audio-video-dpo) to prepare the audio-video preference data. We are working on releasing our generated data. 
+This stage applies AV-DPO to improve the human-preference alignment of T2AV generation. Download the released preference data from Hugging Face:
+
+```bash
+hf download --repo-type dataset JavisVerse/AV-DPO --local-dir data/AV-DPO
+for archive in data/AV-DPO/data_zips/*.zip; do unzip -q "$archive" -d data/AV-DPO; done
+```
+
+Run the commands from the JavisDiT repository root. `train_generated_only.csv` is self-contained. The full `train.csv` reproduces the paper setting and additionally references TAVGBench ground-truth videos, which cannot be redistributed; follow the [data instructions](assets/docs/data.md#using-the-released-av-dpo-data) to resolve them locally. To curate preference data from scratch, see the [AV-DPO curation pipeline](assets/docs/data.md#curating-av-dpo-data-from-scratch).
 
 Then, run the command:
 
@@ -211,7 +220,7 @@ export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 torchrun --standalone --nproc_per_node 8 \
     scripts/train.py \
     configs/javisdit-v1-0/train/stage3_audio_video_dpo.py \
-    --data-path data/meta/avdpo/train_av_dpo.csv
+    --data-path data/AV-DPO/train_generated_only.csv
 ```
 
 The resulting checkpoints will be saved at `runs/0aa-Wan2_1_T2V_1_3B/epoch0bb-global_stepccc/model`.
@@ -325,4 +334,3 @@ If you find JavisDiT is useful and use it in your project, please kindly cite:
 # ⭐️ Star History
 
 [![Star History Chart](https://api.star-history.com/svg?repos=JavisVerse/JavisDiT&type=Date)](https://star-history.com/#JavisVerse/JavisDiT&Date) -->
-
